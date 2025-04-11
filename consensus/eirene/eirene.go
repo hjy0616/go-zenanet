@@ -350,7 +350,7 @@ func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return err
 	}
 
-	// check extr adata
+	// 스프린트 시작 블록인지 확인. Tendermint의 블록 간격을 고려하여 계산
 	isSprintEnd := IsSprintStart(number+1, c.config.CalculateSprint(number))
 
 	// Ensure that the extra-data contains a signer list on checkpoint, but none otherwise
@@ -454,6 +454,8 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		return err
 	}
 
+	// Tendermint 타이밍 검증: Tendermint 블록 생성 간격을 고려하여 타임스탬프 검증
+	// Tendermint는 일반적으로 고정된 블록 생성 간격을 가짐
 	if parent.Time+c.config.CalculatePeriod(number) > header.Time {
 		return ErrInvalidTimestamp
 	}
@@ -464,9 +466,21 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		return err
 	}
 
-	// Verify the validator list match the local contract
+	// 스프린트 시작 블록에서 검증자 세트 확인
 	if IsSprintStart(number+1, c.config.CalculateSprint(number)) {
-		newValidators, err := c.spanner.GetCurrentValidatorsByBlockNrOrHash(context.Background(), rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), number+1)
+		// Tendermint에서 검증자 목록 가져오기
+		var newValidators []*valset.Validator
+		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+			// Tendermint에서 현재 검증자 세트 가져오기
+			newValidators, err = c.TendermintClient.GetValidators(context.Background())
+		} else {
+			// Tendermint 연결이 없는 경우 로컬 스패너에서 검증자 정보 가져오기
+			newValidators, err = c.spanner.GetCurrentValidatorsByBlockNrOrHash(
+				context.Background(),
+				rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+				number+1,
+			)
+		}
 
 		if err != nil {
 			return err
@@ -668,17 +682,21 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		return err
 	}
 
-	// Resolve the authorization key and check against signers
+	// Resolve the authorization key and check against validators
 	signer, err := ecrecover(header, c.signatures, c.config)
 	if err != nil {
 		return err
 	}
 
+	// Tendermint 검증자 세트에서 서명자 확인
 	if !snap.ValidatorSet.HasAddress(signer) {
 		// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
 		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
 	}
 
+	// Tendermint의 경우 서명자가 현재 프로포저여야 함
+	// 하지만 Tendermint는 라운드 로빈 방식으로 프로포저를 선택하므로
+	// 여기서는 서명자가 유효한 검증자인지만 확인
 	succession, err := snap.GetSignerSuccessionNumber(signer)
 	if err != nil {
 		return err
@@ -691,12 +709,16 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		parent = chain.GetHeader(header.ParentHash, number-1)
 	}
 
+	// Tendermint 블록 타이밍 검증
+	// Tendermint에서는 고정된 블록 생성 간격을 가지므로 이를 고려
 	if IsBlockOnTime(parent, header, number, succession, c.config) {
 		return &BlockTooSoonError{number, succession}
 	}
 
 	// Ensure that the difficulty corresponds to the turn-ness of the signer
 	if !c.fakeDiff {
+		// Tendermint는 Difficulty를 사용하지 않지만,
+		// 호환성을 위해 검증자 서명 순서에 따른 난이도 계산 유지
 		difficulty := Difficulty(snap.ValidatorSet, signer)
 		if header.Difficulty.Uint64() != difficulty {
 			return &WrongDifficultyError{number, difficulty, header.Difficulty.Uint64(), signer.Bytes()}
@@ -726,6 +748,7 @@ func (c *Eirene) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 
 	currentSigner := *c.authorizedSigner.Load()
 
+	// Tendermint에서는 블록 생성자(프로포저)가 검증자 세트에서 결정됨
 	// Set the correct difficulty
 	header.Difficulty = new(big.Int).SetUint64(Difficulty(snap.ValidatorSet, currentSigner.signer))
 
@@ -736,9 +759,19 @@ func (c *Eirene) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 
 	header.Extra = header.Extra[:types.ExtraVanityLength]
 
-	// get validator set if number
+	// 스프린트 시작 블록인 경우 validator set을 가져와 헤더에 추가
 	if IsSprintStart(number+1, c.config.CalculateSprint(number)) {
-		newValidators, err := c.spanner.GetCurrentValidatorsByHash(context.Background(), header.ParentHash, number+1)
+		var newValidators []*valset.Validator
+		var err error
+
+		// Tendermint에서 현재 검증자 세트 가져오기
+		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+			newValidators, err = c.TendermintClient.GetValidators(context.Background())
+		} else {
+			// Tendermint 연결이 없는 경우 로컬 스패너에서 검증자 정보 가져오기
+			newValidators, err = c.spanner.GetCurrentValidatorsByHash(context.Background(), header.ParentHash, number+1)
+		}
+
 		if err != nil {
 			return errUnknownValidators
 		}
@@ -806,6 +839,8 @@ func (c *Eirene) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 		}
 	}
 
+	// Tendermint 블록 생성 타이밍 조정
+	// Tendermint는 고정된 블록 간격을 가지지만 Eirene와의 통합을 위해 호환성 유지
 	header.Time = parent.Time + CalcProducerDelay(number, succession, c.config)
 	if header.Time < uint64(time.Now().Unix()) {
 		header.Time = uint64(time.Now().Unix())
@@ -1009,6 +1044,16 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return &UnauthorizedSignerError{number - 1, currentSigner.signer.Bytes()}
 	}
 
+	// Tendermint에서는 현재 프로포저만 블록을 생성할 수 있음
+	// 그러나 여기서는 유효성 검사만 수행하고 실제 블록 생성은 Tendermint가 담당
+	proposer := snap.ValidatorSet.GetProposer()
+	if proposer.Address != currentSigner.signer {
+		log.Info("Not our turn to sign a block",
+			"proposer", proposer.Address.Hex(),
+			"currentSigner", currentSigner.signer.Hex())
+		// 블록 생성을 중단하지는 않고, 로그만 남김
+	}
+
 	successionNumber, err := snap.GetSignerSuccessionNumber(currentSigner.signer)
 	if err != nil {
 		return err
@@ -1041,7 +1086,7 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 					"hash", header.Hash,
 					"wiggle-in-sec", uint(wiggle),
 					"wiggle", common.PrettyDuration(wiggle),
-					"in-turn-signer", snap.ValidatorSet.GetProposer().Address.Hex(),
+					"in-turn-signer", proposer.Address.Hex(),
 				)
 			}
 
@@ -1082,7 +1127,16 @@ func (c *Eirene) CalcDifficulty(chain consensus.ChainHeaderReader, _ uint64, par
 		return nil
 	}
 
-	return new(big.Int).SetUint64(Difficulty(snap.ValidatorSet, c.authorizedSigner.Load().signer))
+	// Tendermint에서는 난이도가 중요하지 않지만,
+	// Geth의 합의 엔진 인터페이스와의 호환성을 위해 유지
+	// 검증자의 서명 순서에 따른 난이도 값 계산
+	currentSigner := c.authorizedSigner.Load()
+	if currentSigner == nil {
+		// 서명자가 설정되지 않은 경우 기본 난이도 1 반환
+		return new(big.Int).SetUint64(1)
+	}
+
+	return new(big.Int).SetUint64(Difficulty(snap.ValidatorSet, currentSigner.signer))
 }
 
 // SealHash returns the hash of a block prior to it being sealed.
