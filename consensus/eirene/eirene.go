@@ -350,6 +350,78 @@ func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return err
 	}
 
+	// check extr adata
+	isSprintEnd := IsSprintStart(number+1, c.config.CalculateSprint(number))
+
+	// Ensure that the extra-data contains a signer list on checkpoint, but none otherwise
+	signersBytes := len(header.GetValidatorBytes(c.chainConfig))
+
+	if !isSprintEnd && signersBytes != 0 {
+		return errExtraValidators
+	}
+
+	if isSprintEnd && signersBytes%validatorHeaderBytesLength != 0 {
+		log.Warn("Invalid validator set", "number", number, "signersBytes", signersBytes)
+		return errInvalidSpanValidators
+	}
+
+	// Ensure that the mix digest is zero as we don't have fork protection currently
+	if header.MixDigest != (common.Hash{}) {
+		return errInvalidMixDigest
+	}
+
+	// Ensure that the block doesn't contain any uncles which are meaningless in PoA
+	if header.UncleHash != uncleHash {
+		return errInvalidUncleHash
+	}
+
+	// Ensure that the block's difficulty is meaningful (may not be correct at this point)
+	if number > 0 {
+		if header.Difficulty == nil {
+			return errInvalidDifficulty
+		}
+	}
+
+	// Verify that the gas limit is <= 2^63-1
+	gasCap := uint64(0x7fffffffffffffff)
+	if header.GasLimit > gasCap {
+		return fmt.Errorf("invalid gasLimit: have %v, max %v", header.GasLimit, gasCap)
+	}
+
+	if header.WithdrawalsHash != nil {
+		return consensus.ErrUnexpectedWithdrawals
+	}
+
+	// All basic checks passed, verify cascading fields
+	return c.verifyCascadingFields(chain, header, parents)
+}
+
+// validateHeaderExtraField validates that the extra-data contains both the vanity and signature.
+// header.Extra = header.Vanity + header.ProducerBytes (optional) + header.Seal
+func validateHeaderExtraField(extraBytes []byte) error {
+	if len(extraBytes) < types.ExtraVanityLength {
+		return errMissingVanity
+	}
+
+	if len(extraBytes) < types.ExtraVanityLength+types.ExtraSealLength {
+		return errMissingSignature
+	}
+
+	return nil
+}
+
+// verifyCascadingFields verifies all the header fields that are not standalone,
+// rather depend on a batch of previous headers. The caller may optionally pass
+// in a batch of parents (ascending order) to avoid looking those up from the
+// database. This is useful for concurrently verifying a batch of new headers.
+func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+	// The genesis block is the always valid dead-end
+	number := header.Number.Uint64()
+
+	if number == 0 {
+		return nil
+	}
+
 	// Ensure that the block's timestamp isn't too close to it's parent
 	var parent *types.Header
 
@@ -382,8 +454,7 @@ func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return err
 	}
 
-	// Tendermint는 블록 시간이 항상 이전 블록보다 적어도 1초 이상 커야 함
-	if parent.Time+1 > header.Time {
+	if parent.Time+c.config.CalculatePeriod(number) > header.Time {
 		return ErrInvalidTimestamp
 	}
 
@@ -393,67 +464,54 @@ func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return err
 	}
 
-	// 검증자 업데이트 블록인 경우 검증자 목록을 검증
-	if number > 0 && number%c.config.CalculateSprint(number) == 0 {
-		// Tendermint 클라이언트에서 현재 검증자 세트를 가져옴
-		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(context.Background())
+	// Verify the validator list match the local contract
+	if IsSprintStart(number+1, c.config.CalculateSprint(number)) {
+		newValidators, err := c.spanner.GetCurrentValidatorsByBlockNrOrHash(context.Background(), rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), number+1)
+
 		if err != nil {
-			log.Error("Failed to get current validator set from Tendermint", "err", err)
 			return err
 		}
 
-		if validatorSet == nil || len(validatorSet.Validators) == 0 {
-			return errUnknownValidators
-		}
+		sort.Sort(valset.ValidatorsByAddress(newValidators))
 
-		// 헤더에서 검증자 목록 파싱
 		headerVals, err := valset.ParseValidators(header.GetValidatorBytes(c.chainConfig))
 		if err != nil {
 			return err
 		}
 
-		// 검증자 목록 비교
-		if len(validatorSet.Validators) != len(headerVals) {
-			log.Warn("Invalid validator set",
-				"block number", number,
-				"tendermint validators", valset.ValidatorListString(validatorSet.Validators),
-				"header validators", valset.ValidatorListString(headerVals))
+		if len(newValidators) != len(headerVals) {
+			log.Warn("Invalid validator set", "block number", number, "newValidators", newValidators, "headerVals", headerVals)
 			return errInvalidSpanValidators
 		}
 
-		// 검증자 목록 순서 정렬 (주소 기준)
-		sort.Sort(valset.ValidatorsByAddress(validatorSet.Validators))
-		sort.Sort(valset.ValidatorsByAddress(headerVals))
-
-		// 각 검증자 비교
-		for i, val := range validatorSet.Validators {
+		for i, val := range newValidators {
 			if !bytes.Equal(val.HeaderBytes(), headerVals[i].HeaderBytes()) {
-				log.Warn("Invalid validator",
-					"block number", number,
-					"index", i,
-					"tendermint validator", val.String(),
-					"header validator", headerVals[i].String())
+				log.Warn("Invalid validator set", "block number", number, "index", i, "local validator", val, "header validator", headerVals[i])
 				return errInvalidSpanValidators
 			}
 		}
 	}
 
-	// All checks passed, the header is valid
-	return nil
-}
+	// verify the validator list in the last sprint block
+	if IsSprintStart(number, c.config.CalculateSprint(number)) {
+		parentValidatorBytes := parent.GetValidatorBytes(c.chainConfig)
+		validatorsBytes := make([]byte, len(snap.ValidatorSet.Validators)*validatorHeaderBytesLength)
 
-// validateHeaderExtraField validates that the extra-data contains both the vanity and signature.
-// header.Extra = header.Vanity + header.ProducerBytes (optional) + header.Seal
-func validateHeaderExtraField(extraBytes []byte) error {
-	if len(extraBytes) < types.ExtraVanityLength {
-		return errMissingVanity
+		currentValidators := snap.ValidatorSet.Copy().Validators
+		// sort validator by address
+		sort.Sort(valset.ValidatorsByAddress(currentValidators))
+
+		for i, validator := range currentValidators {
+			copy(validatorsBytes[i*validatorHeaderBytesLength:], validator.HeaderBytes())
+		}
+		// len(header.Extra) >= extraVanity+extraSeal has already been validated in validateHeaderExtraField, so this won't result in a panic
+		if !bytes.Equal(parentValidatorBytes, validatorsBytes) {
+			return &MismatchingValidatorsError{number - 1, validatorsBytes, parentValidatorBytes}
+		}
 	}
 
-	if len(extraBytes) < types.ExtraVanityLength+types.ExtraSealLength {
-		return errMissingSignature
-	}
-
-	return nil
+	// All basic checks passed, verify the seal and return
+	return c.verifySeal(chain, header, parents)
 }
 
 // snapshot retrieves the authorization snapshot at a given point in time.
