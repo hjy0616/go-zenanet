@@ -77,6 +77,9 @@ func (c *TendermintABCIClient) Connect() error {
 		return fmt.Errorf("failed to connect to RPC endpoint: %w", rpcErr)
 	}
 
+	// 백그라운드에서 연결 상태를 모니터링하고 필요시 재연결
+	go c.monitorConnections()
+
 	return nil
 }
 
@@ -312,138 +315,179 @@ func (c *TendermintABCIClient) GetCurrentValidatorSet(ctx context.Context) (*val
 
 // StateSyncEvents는 특정 ID부터 지정된 블록까지의 상태 동기화 이벤트를 검색합니다.
 func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint64, to int64) ([]*clerk.EventRecordWithTime, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	var events []*clerk.EventRecordWithTime
 
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
-	}
+	err := c.withRetry(3, func() error {
+		c.rpcMutex.RLock()
+		defer c.rpcMutex.RUnlock()
 
-	// Tendermint RPC를 통해 이벤트 조회
-	// 여기서는 tx_search를 사용하여 특정 타입의 이벤트를 조회합니다
-	query := fmt.Sprintf("state_sync.from_id >= %d AND state_sync.to_block <= %d", fromID, to)
-	searchResult, err := c.rpcClient.TxSearch(ctx, query, false, nil, nil, "asc")
-	if err != nil {
-		return nil, fmt.Errorf("failed to search state sync events: %w", err)
-	}
-
-	// 결과를 EventRecordWithTime 형태로 변환
-	events := make([]*clerk.EventRecordWithTime, 0, len(searchResult.Txs))
-	for _, tx := range searchResult.Txs {
-		// 각 트랜잭션에서 이벤트 데이터 추출
-		for _, event := range tx.TxResult.Events {
-			if event.Type != "state_sync" {
-				continue
-			}
-
-			// 이벤트 속성에서 필요한 데이터 추출
-			var id uint64
-			var stateID uint64
-			var recordTime time.Time
-			var data []byte
-
-			for _, attr := range event.Attributes {
-				key := string(attr.Key)
-				value := attr.Value
-
-				switch key {
-				case "id":
-					id, _ = strconv.ParseUint(string(value), 10, 64)
-				case "state_id":
-					stateID, _ = strconv.ParseUint(string(value), 10, 64)
-				case "time":
-					timeInt, _ := strconv.ParseInt(string(value), 10, 64)
-					recordTime = time.Unix(timeInt, 0)
-				case "data":
-					data = value
-				}
-			}
-
-			// EventRecordWithTime 생성 및 추가
-			record := &clerk.EventRecord{
-				ID:      id,
-				StateID: stateID,
-				Data:    data,
-			}
-			eventWithTime := &clerk.EventRecordWithTime{
-				EventRecord: record,
-				RecordTime:  recordTime,
-			}
-			events = append(events, eventWithTime)
+		if !c.isRPCConnected {
+			return ErrRPCNotConnected
 		}
-	}
 
-	return events, nil
+		// Tendermint RPC를 통해 이벤트 조회
+		// 여기서는 tx_search를 사용하여 특정 타입의 이벤트를 조회합니다
+		query := fmt.Sprintf("state_sync.from_id >= %d AND state_sync.to_block <= %d", fromID, to)
+		searchResult, err := c.rpcClient.TxSearch(ctx, query, false, nil, nil, "asc")
+		if err != nil {
+			return fmt.Errorf("failed to search state sync events: %w", err)
+		}
+
+		// 결과를 EventRecordWithTime 형태로 변환
+		tempEvents := make([]*clerk.EventRecordWithTime, 0, len(searchResult.Txs))
+		for _, tx := range searchResult.Txs {
+			// 각 트랜잭션에서 이벤트 데이터 추출
+			for _, event := range tx.TxResult.Events {
+				if event.Type != "state_sync" {
+					continue
+				}
+
+				// 이벤트 속성에서 필요한 데이터 추출
+				var id uint64
+				var recordTime time.Time
+				var data []byte
+				var contractAddr common.Address
+				var txHash common.Hash
+				var logIndex uint64
+				var chainID string
+
+				for _, attr := range event.Attributes {
+					key := string(attr.Key)
+					value := attr.Value
+
+					switch key {
+					case "id":
+						id, _ = strconv.ParseUint(string(value), 10, 64)
+					case "time":
+						timeInt, _ := strconv.ParseInt(string(value), 10, 64)
+						recordTime = time.Unix(timeInt, 0)
+					case "data":
+						data = value
+					case "contract":
+						contractAddr = common.HexToAddress(string(value))
+					case "tx_hash":
+						txHash = common.HexToHash(string(value))
+					case "log_index":
+						logIndex, _ = strconv.ParseUint(string(value), 10, 64)
+					case "chain_id":
+						chainID = string(value)
+					}
+				}
+
+				// ID와 시간이 유효한지 확인
+				if id == 0 || recordTime.IsZero() {
+					log.Warn("Invalid event data", "id", id, "time", recordTime)
+					continue
+				}
+
+				// EventRecordWithTime 생성 및 추가
+				record := &clerk.EventRecord{
+					ID:       id,
+					Data:     data,
+					Contract: contractAddr,
+					TxHash:   txHash,
+					LogIndex: logIndex,
+					ChainID:  chainID,
+				}
+
+				eventWithTime := &clerk.EventRecordWithTime{
+					EventRecord: *record,
+					Time:        recordTime,
+				}
+
+				tempEvents = append(tempEvents, eventWithTime)
+			}
+		}
+
+		events = tempEvents
+		return nil
+	})
+
+	return events, err
 }
 
 // Span는 지정된 spanID에 해당하는 Tendermint 스팬 정보를 가져옵니다.
 func (c *TendermintABCIClient) Span(ctx context.Context, spanID uint64) (*span.TendermintSpan, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	var tendermintSpan *span.TendermintSpan
 
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
-	}
+	err := c.withRetry(3, func() error {
+		c.rpcMutex.RLock()
+		defer c.rpcMutex.RUnlock()
 
-	// Tendermint ABCI Query를 사용하여 스팬 정보 조회
-	path := fmt.Sprintf("span/%d", spanID)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query span: %w", err)
-	}
+		if !c.isRPCConnected {
+			return ErrRPCNotConnected
+		}
 
-	if queryResult.Response.Code != 0 {
-		return nil, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
+		// Tendermint ABCI Query를 사용하여 스팬 정보 조회
+		path := fmt.Sprintf("span/%d", spanID)
+		queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+		if err != nil {
+			return fmt.Errorf("failed to query span: %w", err)
+		}
 
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return nil, fmt.Errorf("no span found for ID %d", spanID)
-	}
+		if queryResult.Response.Code != 0 {
+			return fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+		}
 
-	// 응답 데이터를 TendermintSpan으로 언마샬
-	var tendermintSpan span.TendermintSpan
-	if err := json.Unmarshal(queryResult.Response.Value, &tendermintSpan); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal span data: %w", err)
-	}
+		// 응답 데이터가 없는 경우
+		if len(queryResult.Response.Value) == 0 {
+			return fmt.Errorf("no span found for ID %d", spanID)
+		}
 
-	return &tendermintSpan, nil
+		// 응답 데이터를 TendermintSpan으로 언마샬
+		var tempSpan span.TendermintSpan
+		if err := json.Unmarshal(queryResult.Response.Value, &tempSpan); err != nil {
+			return fmt.Errorf("failed to unmarshal span data: %w", err)
+		}
+
+		tendermintSpan = &tempSpan
+		return nil
+	})
+
+	return tendermintSpan, err
 }
 
 // FetchCheckpoint는 지정된 번호의 체크포인트를 조회합니다.
 func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64) (*checkpoint.Checkpoint, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	var checkpointResult *checkpoint.Checkpoint
 
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
-	}
+	err := c.withRetry(3, func() error {
+		c.rpcMutex.RLock()
+		defer c.rpcMutex.RUnlock()
 
-	// Tendermint ABCI Query를 사용하여 체크포인트 조회
-	path := fmt.Sprintf("checkpoint/%d", number)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query checkpoint: %w", err)
-	}
+		if !c.isRPCConnected {
+			return ErrRPCNotConnected
+		}
 
-	if queryResult.Response.Code != 0 {
-		return nil, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
+		// Tendermint ABCI Query를 사용하여 체크포인트 조회
+		path := fmt.Sprintf("checkpoint/%d", number)
+		queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+		if err != nil {
+			return fmt.Errorf("failed to query checkpoint: %w", err)
+		}
 
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return nil, fmt.Errorf("no checkpoint found for number %d", number)
-	}
+		if queryResult.Response.Code != 0 {
+			return fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+		}
 
-	// 응답 데이터를 Checkpoint 응답으로 언마샬
-	var checkpointResp checkpoint.CheckpointResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &checkpointResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal checkpoint data: %w", err)
-	}
+		// 응답 데이터가 없는 경우
+		if len(queryResult.Response.Value) == 0 {
+			return fmt.Errorf("no checkpoint found for number %d", number)
+		}
 
-	return &checkpointResp.Result, nil
+		// 응답 데이터를 Checkpoint 응답으로 언마샬
+		var checkpointResp checkpoint.CheckpointResponse
+		if err := json.Unmarshal(queryResult.Response.Value, &checkpointResp); err != nil {
+			return fmt.Errorf("failed to unmarshal checkpoint data: %w", err)
+		}
+
+		checkpointResult = &checkpointResp.Result
+		return nil
+	})
+
+	return checkpointResult, err
 }
 
 // FetchCheckpointCount는 체크포인트의 총 개수를 조회합니다.
@@ -685,4 +729,85 @@ func (c *TendermintABCIClient) Close() {
 	c.rpcMutex.Unlock()
 
 	close(c.closeCh)
+}
+
+// monitorConnections는 백그라운드에서 연결 상태를 주기적으로 확인하고 필요시 재연결을 시도합니다.
+func (c *TendermintABCIClient) monitorConnections() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
+			c.checkAndReconnect()
+		}
+	}
+}
+
+// checkAndReconnect는 ABCI 및 RPC 연결 상태를 확인하고 필요시 재연결을 시도합니다.
+func (c *TendermintABCIClient) checkAndReconnect() {
+	// ABCI 연결 확인 및 재연결
+	c.abciMutex.RLock()
+	abciConnected := c.isABCIConnected && c.abciClient != nil && c.abciClient.IsRunning()
+	c.abciMutex.RUnlock()
+
+	if !abciConnected {
+		log.Warn("ABCI connection lost, attempting to reconnect")
+		if err := c.connectABCI(); err != nil {
+			log.Error("Failed to reconnect to ABCI endpoint", "error", err)
+		} else {
+			log.Info("Successfully reconnected to ABCI endpoint")
+		}
+	}
+
+	// RPC 연결 확인 및 재연결
+	c.rpcMutex.RLock()
+	rpcConnected := c.isRPCConnected && c.rpcClient != nil
+	c.rpcMutex.RUnlock()
+
+	if !rpcConnected {
+		log.Warn("RPC connection lost, attempting to reconnect")
+		if err := c.connectRPC(); err != nil {
+			log.Error("Failed to reconnect to RPC endpoint", "error", err)
+		} else {
+			log.Info("Successfully reconnected to RPC endpoint")
+		}
+	}
+}
+
+// withRetry는 함수를 실행하고 오류 발생 시 지정된 횟수만큼 재시도합니다.
+func (c *TendermintABCIClient) withRetry(maxRetries int, operation func() error) error {
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		if err = operation(); err == nil {
+			return nil
+		}
+
+		// 연결 오류인 경우 재연결 시도
+		if errors.Is(err, ErrABCINotConnected) || errors.Is(err, ErrRPCNotConnected) {
+			log.Warn("Connection error detected, attempting to reconnect", "error", err)
+
+			if errors.Is(err, ErrABCINotConnected) {
+				if reconnectErr := c.connectABCI(); reconnectErr != nil {
+					log.Error("Failed to reconnect to ABCI", "error", reconnectErr)
+				}
+			}
+
+			if errors.Is(err, ErrRPCNotConnected) {
+				if reconnectErr := c.connectRPC(); reconnectErr != nil {
+					log.Error("Failed to reconnect to RPC", "error", reconnectErr)
+				}
+			}
+		}
+
+		// 마지막 시도가 아니면 잠시 대기 후 재시도
+		if i < maxRetries-1 {
+			retryDelay := time.Duration(i+1) * time.Second
+			log.Info("Retrying operation", "attempt", i+1, "maxRetries", maxRetries, "delay", retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+	return fmt.Errorf("operation failed after %d attempts: %w", maxRetries, err)
 }
