@@ -1,0 +1,5 @@
+build/bin/{{.BinaryName}} usr/bin
+{{- if eq .BinaryName "gzen" }}
+build/deb/zenanet/completions/bash/gzen etc/bash_completion.d
+build/deb/zenanet/completions/zsh/_gzen usr/share/zsh/vendor-completions
+{{end -}}
