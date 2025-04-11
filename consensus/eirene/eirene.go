@@ -237,7 +237,7 @@ type signer struct {
 	signFn SignerFn       // Signer function to authorize hashes with
 }
 
-// New creates a Eirene consensus engine.
+// New creates a Matic Eirene consensus engine.
 func New(
 	chainConfig *params.ChainConfig,
 	db ethdb.Database,
@@ -247,28 +247,42 @@ func New(
 	genesisContracts GenesisContract,
 	devFakeAuthor bool,
 ) *Eirene {
+	// get eirene config
+	eireneConfig := chainConfig.Eirene
+
+	// Set any missing consensus parameters to their defaults
+	if eireneConfig != nil && eireneConfig.CalculateSprint(0) == 0 {
+		eireneConfig.Sprint = defaultSprintLength
+	}
 	// Allocate the snapshot caches and create the engine
 	recents, _ := lru.NewARC(inmemorySnapshots)
 	signatures, _ := lru.NewARC(inmemorySignatures)
 
 	c := &Eirene{
 		chainConfig:            chainConfig,
-		config:                 chainConfig.Eirene,
+		config:                 eireneConfig,
 		db:                     db,
+		ethAPI:                 ethAPI,
 		recents:                recents,
 		signatures:             signatures,
-		ethAPI:                 ethAPI,
 		spanner:                spanner,
 		GenesisContractsClient: genesisContracts,
 		TendermintClient:       tendermintClient,
 		devFakeAuthor:          devFakeAuthor,
 	}
 
-	// Ensure Tendermint client is connected
-	if tendermintClient != nil && !tendermintClient.IsConnected() {
-		log.Info("Connecting to Tendermint...")
-		if err := tendermintClient.Connect(); err != nil {
-			log.Error("Failed to connect to Tendermint", "err", err)
+	c.authorizedSigner.Store(&signer{
+		common.Address{},
+		func(_ accounts.Account, _ string, i []byte) ([]byte, error) {
+			// return an error to prevent panics
+			return nil, &UnauthorizedSignerError{0, common.Address{}.Bytes()}
+		},
+	})
+
+	// make sure we can decode all the GenesisAlloc in the EireneConfig.
+	for key, genesisAlloc := range c.config.BlockAlloc {
+		if _, err := decodeGenesisAlloc(genesisAlloc); err != nil {
+			panic(fmt.Sprintf("BUG: Block alloc '%s' in genesis is not correct: %v", key, err))
 		}
 	}
 
@@ -281,7 +295,7 @@ func (c *Eirene) Author(header *types.Header) (common.Address, error) {
 	return ecrecover(header, c.signatures, c.config)
 }
 
-// VerifyHeader checks whether a header conforms to the consensus rules of the eirene engine
+// VerifyHeader checks whether a header conforms to the consensus rules.
 func (c *Eirene) VerifyHeader(chain consensus.ChainHeaderReader, header *types.Header) error {
 	return c.verifyHeader(chain, header, nil)
 }
@@ -316,29 +330,66 @@ func (c *Eirene) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*typ
 	return aeirenet, results
 }
 
-// verifyHeader checks whether a header conforms to the consensus rules of the Eirene engine.
-// See YoloV1 paper section 5.2.
-// The verification of eirene header can be done in two ways
-// 1. basic (all normal checks and signature check using validator set from the header itself)
-// 2. bor (basic + validator set verification from totem), used for side chains i.e. erigon
+// verifyHeader checks whether a header conforms to the consensus rules.The
+// caller may optionally pass in a batch of parents (ascending order) to avoid
+// looking those up from the database. This is useful for concurrently verifying
+// a batch of new headers.
 func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
-	// Ensure that the header is sealed properly
 	if header.Number == nil {
 		return errUnknownBlock
 	}
 
 	number := header.Number.Uint64()
 
-	// If the header is a checkpoint block, verify the signer list
-	// The signer list from the block header is verified using the sprint during sprint change
-	// Block must be a multiple of sprint
-	if number > 0 && IsSprintStart(number, c.config.CalculateSprint(number)) && len(header.Extra) >= types.ExtraSealLength {
-		// 헤더의 Extra 데이터에서 검증자 정보 검증
-		signersBytes := len(header.GetValidatorBytes(c.chainConfig))
-		if signersBytes%validatorHeaderBytesLength != 0 {
-			log.Warn("Invalid validator set", "number", number, "signersBytes", signersBytes)
-			return errInvalidSpanValidators
+	// Don't waste time checking blocks from the future
+	if header.Time > uint64(time.Now().Unix()) {
+		return consensus.ErrFutureBlock
+	}
+
+	if err := validateHeaderExtraField(header.Extra); err != nil {
+		return err
+	}
+
+	// check extr adata
+	isSprintEnd := IsSprintStart(number+1, c.config.CalculateSprint(number))
+
+	// Ensure that the extra-data contains a signer list on checkpoint, but none otherwise
+	signersBytes := len(header.GetValidatorBytes(c.chainConfig))
+
+	if !isSprintEnd && signersBytes != 0 {
+		return errExtraValidators
+	}
+
+	if isSprintEnd && signersBytes%validatorHeaderBytesLength != 0 {
+		log.Warn("Invalid validator set", "number", number, "signersBytes", signersBytes)
+		return errInvalidSpanValidators
+	}
+
+	// Ensure that the mix digest is zero as we don't have fork protection currently
+	if header.MixDigest != (common.Hash{}) {
+		return errInvalidMixDigest
+	}
+
+	// Ensure that the block doesn't contain any uncles which are meaningless in PoA
+	if header.UncleHash != uncleHash {
+		return errInvalidUncleHash
+	}
+
+	// Ensure that the block's difficulty is meaningful (may not be correct at this point)
+	if number > 0 {
+		if header.Difficulty == nil {
+			return errInvalidDifficulty
 		}
+	}
+
+	// Verify that the gas limit is <= 2^63-1
+	gasCap := uint64(0x7fffffffffffffff)
+	if header.GasLimit > gasCap {
+		return fmt.Errorf("invalid gasLimit: have %v, max %v", header.GasLimit, gasCap)
+	}
+
+	if header.WithdrawalsHash != nil {
+		return consensus.ErrUnexpectedWithdrawals
 	}
 
 	// All basic checks passed, verify cascading fields
@@ -403,6 +454,8 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		return err
 	}
 
+	// Tendermint 타임스탬프 규칙 검증
+	// 다른 검증자가 제안한 블록이어도 최소 period 이후에 생성되어야 함
 	if parent.Time+c.config.CalculatePeriod(number) > header.Time {
 		return ErrInvalidTimestamp
 	}
@@ -413,12 +466,31 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		return err
 	}
 
-	// Verify the validator list match the local contract
+	// Verify the validator list match the Tendermint validator set
 	if IsSprintStart(number+1, c.config.CalculateSprint(number)) {
-		newValidators, err := c.spanner.GetCurrentValidatorsByBlockNrOrHash(context.Background(), rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), number+1)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-		if err != nil {
-			return err
+		// Tendermint 클라이언트에서 현재 검증자 세트 조회
+		var newValidators []*valset.Validator
+		var err error
+
+		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+			newValidators, err = c.TendermintClient.GetValidators(ctx)
+			if err != nil {
+				log.Warn("Failed to get validators from Tendermint", "err", err)
+				// Tendermint 연결 실패 시 스패너에서 조회
+				newValidators, err = c.spanner.GetCurrentValidatorsByBlockNrOrHash(ctx, rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), number+1)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			// Tendermint 연결이 없는 경우 스패너에서 조회
+			newValidators, err = c.spanner.GetCurrentValidatorsByBlockNrOrHash(ctx, rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), number+1)
+			if err != nil {
+				return err
+			}
 		}
 
 		sort.Sort(valset.ValidatorsByAddress(newValidators))
@@ -429,7 +501,7 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		}
 
 		if len(newValidators) != len(headerVals) {
-			log.Warn("Invalid validator set", "block number", number, "newValidators", newValidators, "headerVals", headerVals)
+			log.Warn("Invalid validator set", "block number", number, "newValidators", len(newValidators), "headerVals", len(headerVals))
 			return errInvalidSpanValidators
 		}
 
@@ -463,144 +535,6 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 	return c.verifySeal(chain, header, parents)
 }
 
-// snapshot retrieves the authorization snapshot at a given point in time.
-// nolint: gocognit
-func (c *Eirene) snapshot(chain consensus.ChainHeaderReader, number uint64, hash common.Hash, parents []*types.Header) (*Snapshot, error) {
-	// Search for a snapshot in memory or on disk for checkpoints
-	signer := common.BytesToAddress(c.authorizedSigner.Load().signer.Bytes())
-	if c.devFakeAuthor && signer.String() != "0x0000000000000000000000000000000000000000" {
-		log.Info("👨‍💻Using DevFakeAuthor", "signer", signer)
-
-		val := valset.NewValidator(signer, 1000)
-		validatorset := valset.NewValidatorSet([]*valset.Validator{val})
-
-		snapshot := newSnapshot(c.chainConfig, c.signatures, number, hash, validatorset.Validators)
-
-		return snapshot, nil
-	}
-
-	var snap *Snapshot
-
-	headers := make([]*types.Header, 0, 16)
-
-	//nolint:govet
-	for snap == nil {
-		// If an in-memory snapshot was found, use that
-		if s, ok := c.recents.Get(hash); ok {
-			snap = s.(*Snapshot)
-
-			break
-		}
-
-		// If an on-disk checkpoint snapshot can be found, use that
-		if number%checkpointInterval == 0 {
-			if s, err := loadSnapshot(c.chainConfig, c.config, c.signatures, c.db, hash); err == nil {
-				log.Trace("Loaded snapshot from disk", "number", number, "hash", hash)
-
-				snap = s
-
-				break
-			}
-		}
-
-		// If we're at the genesis, snapshot the initial state. Alternatively if we're
-		// at a checkpoint block without a parent (light client CHT), or we have piled
-		// up more headers than allowed to be reorged (chain reinit from a freezer),
-		// consider the checkpoint trusted and snapshot it.
-
-		// TODO fix this
-		// nolint:nestif
-		if number == 0 {
-			checkpoint := chain.GetHeaderByNumber(number)
-			if checkpoint != nil {
-				// get checkpoint data
-				hash := checkpoint.Hash()
-
-				// get validators and current span
-				validators, err := c.spanner.GetCurrentValidatorsByHash(context.Background(), hash, number+1)
-				if err != nil {
-					return nil, err
-				}
-
-				// new snap shot
-				snap = newSnapshot(c.chainConfig, c.signatures, number, hash, validators)
-				if err := snap.store(c.db); err != nil {
-					return nil, err
-				}
-
-				log.Info("Stored checkpoint snapshot to disk", "number", number, "hash", hash)
-
-				break
-			}
-		}
-
-		// No snapshot for this header, gather the header and move backward
-		var header *types.Header
-		if len(parents) > 0 {
-			// If we have explicit parents, pick from there (enforced)
-			header = parents[len(parents)-1]
-			if header.Hash() != hash || header.Number.Uint64() != number {
-				return nil, consensus.ErrUnknownAncestor
-			}
-
-			parents = parents[:len(parents)-1]
-		} else {
-			// No explicit parents (or no more left), reach out to the database
-			header = chain.GetHeader(hash, number)
-			if header == nil {
-				return nil, consensus.ErrUnknownAncestor
-			}
-		}
-
-		headers = append(headers, header)
-		number, hash = number-1, header.ParentHash
-	}
-
-	// check if snapshot is nil
-	if snap == nil {
-		return nil, fmt.Errorf("unknown error while retrieving snapshot at block number %v", number)
-	}
-
-	// Previous snapshot found, apply any pending headers on top of it
-	for i := 0; i < len(headers)/2; i++ {
-		headers[i], headers[len(headers)-1-i] = headers[len(headers)-1-i], headers[i]
-	}
-
-	snap, err := snap.apply(headers, c)
-	if err != nil {
-		return nil, err
-	}
-
-	c.recents.Add(snap.Hash, snap)
-
-	// If we've generated a new checkpoint snapshot, save to disk
-	if snap.Number%checkpointInterval == 0 && len(headers) > 0 {
-		if err = snap.store(c.db); err != nil {
-			return nil, err
-		}
-
-		log.Trace("Stored snapshot to disk", "number", snap.Number, "hash", snap.Hash)
-	}
-
-	return snap, err
-}
-
-// VerifyUncles implements consensus.Engine, always returning an error for any
-// uncles as this consensus mechanism doesn't permit uncles.
-func (c *Eirene) VerifyUncles(_ consensus.ChainReader, block *types.Block) error {
-	if len(block.Uncles()) > 0 {
-		return errUncleDetected
-	}
-
-	return nil
-}
-
-// VerifySeal implements consensus.Engine, checking whether the signature contained
-// in the header satisfies the consensus protocol requirements.
-func (c *Eirene) VerifySeal(chain consensus.ChainHeaderReader, header *types.Header) error {
-	return c.verifySeal(chain, header, nil)
-}
-
 // verifySeal checks whether the signature contained in the header satisfies the
 // consensus protocol requirements. The method accepts an optional list of parent
 // headers that aren't yet part of the local blockchain to generate the snapshots
@@ -617,34 +551,41 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		return err
 	}
 
-	// Resolve the authorization key and check against signers
+	// Tendermint 기반 서명 검증 로직 적용
+	// 블록 헤더에서 서명 추출하여 서명 검증
 	signer, err := ecrecover(header, c.signatures, c.config)
 	if err != nil {
 		return err
 	}
 
+	// Tendermint 검증자 세트에 서명자가 포함되어 있는지 확인
 	if !snap.ValidatorSet.HasAddress(signer) {
-		// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
+		// 검증자 목록에 없는 서명자
 		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
 	}
 
+	// 서명자의 순서 확인 (proposer priority 기반)
 	succession, err := snap.GetSignerSuccessionNumber(signer)
 	if err != nil {
 		return err
 	}
 
+	// 부모 블록 조회
 	var parent *types.Header
-	if len(parents) > 0 { // if parents is nil, len(parents) is zero
+	if len(parents) > 0 {
 		parent = parents[len(parents)-1]
 	} else if number > 0 {
 		parent = chain.GetHeader(header.ParentHash, number-1)
 	}
 
+	// 블록 타이밍 검증 - 너무 빨리 생성된 블록 방지
+	// Tendermint는 검증자별로 블록 생성 시간 규칙이 있음
 	if IsBlockOnTime(parent, header, number, succession, c.config) {
 		return &BlockTooSoonError{number, succession}
 	}
 
-	// Ensure that the difficulty corresponds to the turn-ness of the signer
+	// Tendermint는 검증자의 지분(voting power)에 따라 블록 생성 가중치가 다름
+	// 그에 맞는 난이도 값 검증
 	if !c.fakeDiff {
 		difficulty := Difficulty(snap.ValidatorSet, signer)
 		if header.Difficulty.Uint64() != difficulty {
@@ -791,23 +732,7 @@ func (c *Eirene) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 			return
 		}
 
-		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-			// Tendermint에 블록 완성 상태 통지
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			log.Info("Notifying Tendermint about block finalization",
-				"number", headerNumber,
-				"hash", header.Hash())
-
-			// Tendermint에서 현재 검증자 세트 가져오기
-			validators, valErr := c.TendermintClient.GetCurrentValidatorSet(ctx)
-			if valErr != nil {
-				log.Warn("Failed to get validator set from Tendermint", "error", valErr)
-			} else {
-				log.Debug("Current Tendermint validator set", "count", len(validators.Validators))
-			}
-
+		if c.TendermintClient != nil {
 			// commit states
 			stateSyncData, err = c.CommitStates(stateDB, header, cx)
 			if err != nil {
@@ -901,19 +826,7 @@ func (c *Eirene) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 			return nil, err
 		}
 
-		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-			// Tendermint에 새로운 검증자 세트 정보 전송
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			validators, valErr := c.GetCurrentValidators(ctx, header.Hash(), headerNumber)
-			if valErr != nil {
-				log.Warn("Failed to get validators for Tendermint", "error", valErr)
-			} else {
-				log.Info("Sending validator set to Tendermint", "validators", len(validators))
-				// 여기서 필요한 경우 Tendermint에 검증자 정보를 전송할 수 있음
-			}
-
+		if c.TendermintClient != nil {
 			// commit states
 			stateSyncData, err = c.CommitStates(stateDB, header, cx)
 			if err != nil {
@@ -936,16 +849,6 @@ func (c *Eirene) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 
 	// Assemble block
 	block := types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))
-
-	// 블록 최종화 전 Tendermint와 상태 확인
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		log.Debug("Verifying block with Tendermint before finalization",
-			"number", headerNumber,
-			"hash", header.Hash().Hex(),
-			"transactions", len(body.Transactions))
-
-		// 추가 검증이 필요한 경우 Tendermint API를 호출할 수 있음
-	}
 
 	// set state sync
 	if bc, ok := chain.(*core.BlockChain); ok {
@@ -971,13 +874,11 @@ func (c *Eirene) Authorize(currentSigner common.Address, signFn SignerFn) {
 // the local signing credentials.
 func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	header := block.Header()
-
 	// Sealing the genesis block is not supported
 	number := header.Number.Uint64()
 	if number == 0 {
 		return errUnknownBlock
 	}
-
 	// For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
 	if c.config.CalculatePeriod(number) == 0 && len(block.Transactions()) == 0 {
 		log.Info("Sealing paused, waiting for transactions")
@@ -985,86 +886,79 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	}
 
 	// Don't hold the signer fields for the entire sealing procedure
-	authorizedSigner := c.authorizedSigner.Load()
+	currentSigner := *c.authorizedSigner.Load()
 
-	if authorizedSigner == nil {
-		log.Error("Signer not authorized for sealing")
-		return errUnauthorizedSigner
-	}
-
-	currentSigner := authorizedSigner.signer
-	signFn := authorizedSigner.signFn
-
-	// Sweet, the protocol permits us to sign the block, wait for our time
-	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
-	if delay < 0 {
-		delay = 0
-	}
-
-	// Sign all the things!
-	sealHash := SealHash(header, c.config)
-	hashBytes := sealHash.Bytes()
-	sighash, err := signFn(accounts.Account{Address: currentSigner}, accounts.MimetypeEirene, hashBytes)
-
+	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
 	if err != nil {
 		return err
 	}
 
-	copy(header.Extra[len(header.Extra)-types.ExtraSealLength:], sighash)
+	// Bail out if we're unauthorized to sign a block
+	if !snap.ValidatorSet.HasAddress(currentSigner.signer) {
+		// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
+		return &UnauthorizedSignerError{number - 1, currentSigner.signer.Bytes()}
+	}
 
-	// Check if we're authorized to sign the header
-	if err := c.checkAuthorization(chain, header, currentSigner); err != nil {
-		log.Warn("Block sealing failed", "err", err)
+	successionNumber, err := snap.GetSignerSuccessionNumber(currentSigner.signer)
+	if err != nil {
 		return err
 	}
 
-	// Tendermint 확인 및 동기화
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Sweet, the protocol permits us to sign the block, wait for our time
+	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
+	// wiggle was already accounted for in header.Time, this is just for logging
+	wiggle := time.Duration(successionNumber) * time.Duration(c.config.CalculateBackupMultiplier(number)) * time.Second
 
-	// Tendermint에게 블록 전송
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		// TODO: DeliverTx 호출로 블록 정보 전송
-		log.Info("Sending block to Tendermint", "number", number, "hash", header.Hash().Hex())
+	// Sign all the things!
+	err = Sign(currentSigner.signFn, currentSigner.signer, header, c.config)
+	if err != nil {
+		return err
 	}
 
-	// 블록 생성 완료 및 결과 반환
+	// Wait until sealing is terminated or delay timeout.
+	log.Info("Waiting for slot to sign and propagate", "number", number, "hash", header.Hash, "delay-in-sec", uint(delay), "delay", common.PrettyDuration(delay))
+
 	go func() {
 		select {
 		case <-stop:
+			log.Debug("Discarding sealing operation for block", "number", number)
 			return
+		case <-time.After(delay):
+			if wiggle > 0 {
+				log.Info(
+					"Sealing out-of-turn",
+					"number", number,
+					"hash", header.Hash,
+					"wiggle-in-sec", uint(wiggle),
+					"wiggle", common.PrettyDuration(wiggle),
+					"in-turn-signer", snap.ValidatorSet.GetProposer().Address.Hex(),
+				)
+			}
+
+			log.Info(
+				"Sealing successful",
+				"number", number,
+				"delay", delay,
+				"headerDifficulty", header.Difficulty,
+			)
+		}
+		select {
 		case results <- block.WithSeal(header):
+		default:
+			log.Warn("Sealing result was not read by miner", "number", number, "sealhash", SealHash(header, c.config))
 		}
 	}()
 
 	return nil
 }
 
-// 새로 추가: Tendermint 권한 확인 함수
-func (c *Eirene) checkAuthorization(chain consensus.ChainHeaderReader, header *types.Header, signer common.Address) error {
-	// Tendermint 검증자 확인
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		validators, err := c.TendermintClient.GetValidators(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get validators from Tendermint: %w", err)
-		}
-
-		// 검증자 집합에 현재 서명자가 있는지 확인
-		isValidator := false
-		for _, validator := range validators {
-			if validator.Address == signer {
-				isValidator = true
-				break
-			}
-		}
-
-		if !isValidator {
-			return errUnauthorizedSigner
-		}
+func Sign(signFn SignerFn, signer common.Address, header *types.Header, c *params.EireneConfig) error {
+	sighash, err := signFn(accounts.Account{Address: signer}, accounts.MimetypeEirene, EireneRLP(header, c))
+	if err != nil {
+		return err
 	}
+
+	copy(header.Extra[len(header.Extra)-types.ExtraSealLength:], sighash)
 
 	return nil
 }
@@ -1108,6 +1002,146 @@ func (c *Eirene) Close() error {
 	return nil
 }
 
+// snapshot retrieves the authorization snapshot at a given point in time.
+// nolint: gocognit
+func (c *Eirene) snapshot(chain consensus.ChainHeaderReader, number uint64, hash common.Hash, parents []*types.Header) (*Snapshot, error) {
+	// Search for a snapshot in memory or on disk for checkpoints
+	signer := common.BytesToAddress(c.authorizedSigner.Load().signer.Bytes())
+	if c.devFakeAuthor && signer.String() != "0x0000000000000000000000000000000000000000" {
+		log.Info("👨‍💻Using DevFakeAuthor", "signer", signer)
+
+		val := valset.NewValidator(signer, 1000)
+		validatorset := valset.NewValidatorSet([]*valset.Validator{val})
+
+		snapshot := newSnapshot(c.chainConfig, c.signatures, number, hash, validatorset.Validators)
+
+		return snapshot, nil
+	}
+
+	var snap *Snapshot
+
+	headers := make([]*types.Header, 0, 16)
+
+	//nolint:govet
+	for snap == nil {
+		// If an in-memory snapshot was found, use that
+		if s, ok := c.recents.Get(hash); ok {
+			snap = s.(*Snapshot)
+
+			break
+		}
+
+		// If an on-disk checkpoint snapshot can be found, use that
+		if number%checkpointInterval == 0 {
+			if s, err := loadSnapshot(c.chainConfig, c.config, c.signatures, c.db, hash); err == nil {
+				log.Trace("Loaded snapshot from disk", "number", number, "hash", hash)
+
+				snap = s
+
+				break
+			}
+		}
+
+		// If we're at the genesis, snapshot the initial state. Alternatively if we're
+		// at a checkpoint block without a parent (light client CHT), or we have piled
+		// up more headers than allowed to be reorged (chain reinit from a freezer),
+		// consider the checkpoint trusted and snapshot it.
+
+		// TODO fix this
+		// nolint:nestif
+		if number == 0 {
+			checkpoint := chain.GetHeaderByNumber(number)
+			if checkpoint != nil {
+				// get checkpoint data
+				hash := checkpoint.Hash()
+
+				// get validators from Tendermint
+				var validators []*valset.Validator
+				var err error
+
+				// 먼저 Tendermint 클라이언트를 통해 검증자 조회 시도
+				if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+
+					validators, err = c.TendermintClient.GetValidators(ctx)
+					if err != nil {
+						log.Warn("Failed to get validators from Tendermint, falling back to spanner", "err", err)
+					}
+				}
+
+				// Tendermint에서 조회 실패 시 spanner에서 조회
+				if validators == nil || len(validators) == 0 {
+					validators, err = c.spanner.GetCurrentValidatorsByHash(context.Background(), hash, number+1)
+					if err != nil {
+						return nil, err
+					}
+				}
+
+				// new snap shot
+				snap = newSnapshot(c.chainConfig, c.signatures, number, hash, validators)
+				if err := snap.store(c.db); err != nil {
+					return nil, err
+				}
+
+				log.Info("Stored checkpoint snapshot to disk", "number", number, "hash", hash)
+
+				break
+			}
+		}
+
+		// No snapshot for this header, gather the header and move backward
+		var header *types.Header
+		if len(parents) > 0 {
+			// If we have explicit parents, pick from there (enforced)
+			header = parents[len(parents)-1]
+			if header.Hash() != hash || header.Number.Uint64() != number {
+				return nil, consensus.ErrUnknownAncestor
+			}
+
+			parents = parents[:len(parents)-1]
+		} else {
+			// No explicit parents (or no more left), reach out to the database
+			header = chain.GetHeader(hash, number)
+			if header == nil {
+				return nil, consensus.ErrUnknownAncestor
+			}
+		}
+
+		headers = append(headers, header)
+		number, hash = number-1, header.ParentHash
+	}
+
+	// check if snapshot is nil
+	if snap == nil {
+		return nil, fmt.Errorf("unknown error while retrieving snapshot at block number %v", number)
+	}
+
+	// Previous snapshot found, apply any pending headers on top of it
+	for i := 0; i < len(headers)/2; i++ {
+		headers[i], headers[len(headers)-1-i] = headers[len(headers)-1-i], headers[i]
+	}
+
+	snap, err := snap.apply(headers, c)
+	if err != nil {
+		return nil, err
+	}
+
+	c.recents.Add(snap.Hash, snap)
+
+	// If we've generated a new checkpoint snapshot, save to disk
+	if snap.Number%checkpointInterval == 0 && len(headers) > 0 {
+		if err = snap.store(c.db); err != nil {
+			return nil, err
+		}
+
+		log.Trace("Stored snapshot to disk", "number", snap.Number, "hash", snap.Hash)
+	}
+
+	return snap, err
+}
+
+// checkAndCommitSpan gets the span update object from Tendermint and commits it in the EVM state.
 func (c *Eirene) checkAndCommitSpan(
 	state *state.StateDB,
 	header *types.Header,
