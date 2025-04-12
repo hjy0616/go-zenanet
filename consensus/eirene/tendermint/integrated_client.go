@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/tendermint/tendermint/abci/types"
 
@@ -204,103 +203,42 @@ func (c *IntegratedTendermintClient) Commit(ctx context.Context) (*types.Respons
 	return c.abciClient.Commit(ctx)
 }
 
-// GetValidators calls the appropriate client's GetValidators method
+// GetValidators calls the ABCI client's GetValidators method
 func (c *IntegratedTendermintClient) GetValidators(ctx context.Context) ([]*valset.Validator, error) {
-	// 먼저 ABCI 클라이언트 시도
 	c.abciMutex.RLock()
-	abciConnected := c.abciClient.IsConnected()
-	c.abciMutex.RUnlock()
+	defer c.abciMutex.RUnlock()
 
-	if abciConnected {
-		validators, err := c.abciClient.GetValidators(ctx)
-		if err == nil {
-			return validators, nil
-		}
-		log.Warn("Failed to get validators from ABCI client, falling back to HTTP client", "error", err)
+	if !c.abciClient.IsConnected() {
+		return nil, fmt.Errorf("ABCI client is not connected")
 	}
 
-	// ABCI 실패 시 HTTP 클라이언트 사용
-	c.httpMutex.RLock()
-	defer c.httpMutex.RUnlock()
-
-	return c.httpClient.GetValidators(ctx)
+	return c.abciClient.GetValidators(ctx)
 }
 
-// GetCurrentValidatorSet calls the appropriate client's GetCurrentValidatorSet method
+// GetCurrentValidatorSet calls the ABCI client's GetCurrentValidatorSet method
 func (c *IntegratedTendermintClient) GetCurrentValidatorSet(ctx context.Context) (*valset.ValidatorSet, error) {
-	// 먼저 ABCI 클라이언트 시도
 	c.abciMutex.RLock()
-	abciConnected := c.abciClient.IsConnected()
-	c.abciMutex.RUnlock()
+	defer c.abciMutex.RUnlock()
 
-	if abciConnected {
-		validatorSet, err := c.abciClient.GetCurrentValidatorSet(ctx)
-		if err == nil {
-			return validatorSet, nil
-		}
-		log.Warn("Failed to get current validator set from ABCI client, falling back to HTTP client", "error", err)
+	if !c.abciClient.IsConnected() {
+		return nil, fmt.Errorf("ABCI client is not connected")
 	}
 
-	// ABCI 실패 시 HTTP 클라이언트 사용
-	c.httpMutex.RLock()
-	defer c.httpMutex.RUnlock()
-
-	return c.httpClient.GetCurrentValidatorSet(ctx)
+	return c.abciClient.GetCurrentValidatorSet(ctx)
 }
 
 // Close closes both HTTP and ABCI clients
 func (c *IntegratedTendermintClient) Close() {
-	// 이미 닫혔는지 확인
-	select {
-	case <-c.closeCh:
-		// 이미 닫힌 상태
-		return
-	default:
-		// 아직 열려 있음, 닫기 진행
-		close(c.closeCh)
-	}
+	// HTTP 클라이언트 종료
+	c.httpMutex.Lock()
+	c.httpClient.Close()
+	c.httpMutex.Unlock()
 
-	var wg sync.WaitGroup
+	// ABCI 클라이언트 종료
+	c.abciMutex.Lock()
+	c.abciClient.Close()
+	c.abciMutex.Unlock()
 
-	// HTTP 클라이언트 닫기
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		c.httpMutex.Lock()
-		defer c.httpMutex.Unlock()
-
-		if c.httpClient != nil {
-			c.httpClient.Close()
-			log.Info("Closed HTTP client")
-		}
-	}()
-
-	// ABCI 클라이언트 닫기
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		c.abciMutex.Lock()
-		defer c.abciMutex.Unlock()
-
-		if c.abciClient != nil {
-			c.abciClient.Close()
-			log.Info("Closed ABCI client")
-		}
-	}()
-
-	// 최대 5초간 대기
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Info("Successfully closed all Tendermint client connections")
-	case <-time.After(5 * time.Second):
-		log.Warn("Timeout while waiting for Tendermint client connections to close")
-	}
+	close(c.closeCh)
+	log.Info("Integrated Tendermint client closed")
 }
