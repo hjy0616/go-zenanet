@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/big"
 
+	"github.com/holiman/uint256"
 	ethereum "github.com/zenanetwork/go-zenanet"
 	"github.com/zenanetwork/go-zenanet/common"
 	"github.com/zenanetwork/go-zenanet/consensus"
@@ -15,14 +16,13 @@ import (
 	"github.com/zenanetwork/go-zenanet/core/vm"
 	"github.com/zenanetwork/go-zenanet/log"
 	"github.com/zenanetwork/go-zenanet/params"
-	"github.com/holiman/uint256"
 )
 
 var systemAddress = common.HexToAddress("0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE")
 
 type ChainContext struct {
-	Chain consensus.ChainHeaderReader
-	Eirene   consensus.Engine
+	Chain  consensus.ChainHeaderReader
+	Eirene consensus.Engine
 }
 
 func (c ChainContext) Engine() consensus.Engine {
@@ -31,6 +31,11 @@ func (c ChainContext) Engine() consensus.Engine {
 
 func (c ChainContext) GetHeader(hash common.Hash, number uint64) *types.Header {
 	return c.Chain.GetHeader(hash, number)
+}
+
+// Config returns the chain config
+func (c ChainContext) Config() *params.ChainConfig {
+	return c.Chain.Config()
 }
 
 // callmsg implements core.Message to allow passing it as a transaction simulator.
