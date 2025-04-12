@@ -668,6 +668,21 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		return err
 	}
 
+	// Tendermint 검증자 세트를 확인하고 가능하면 사용
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(ctx)
+		if err == nil && validatorSet != nil {
+			// Tendermint 검증자 세트로 스냅샷 업데이트
+			snap.ValidatorSet = validatorSet
+			log.Debug("Using Tendermint validator set for verification",
+				"validators", len(validatorSet.Validators),
+				"block", number)
+		}
+	}
+
 	// Resolve the authorization key and check against signers
 	signer, err := ecrecover(header, c.signatures, c.config)
 	if err != nil {
@@ -697,6 +712,7 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 
 	// Ensure that the difficulty corresponds to the turn-ness of the signer
 	if !c.fakeDiff {
+		// PoS 시스템을 위한 난이도 계산 (Tendermint 통합)
 		difficulty := Difficulty(snap.ValidatorSet, signer)
 		if header.Difficulty.Uint64() != difficulty {
 			return &WrongDifficultyError{number, difficulty, header.Difficulty.Uint64(), signer.Bytes()}
@@ -724,6 +740,21 @@ func (c *Eirene) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 		return err
 	}
 
+	// Tendermint 검증자 세트를 확인하고 가능하면 사용
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(ctx)
+		if err == nil && validatorSet != nil {
+			// Tendermint 검증자 세트로 스냅샷 업데이트
+			snap.ValidatorSet = validatorSet
+			log.Debug("Using Tendermint validator set for block preparation",
+				"validators", len(validatorSet.Validators),
+				"block", number)
+		}
+	}
+
 	currentSigner := *c.authorizedSigner.Load()
 
 	// Set the correct difficulty
@@ -738,15 +769,42 @@ func (c *Eirene) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 
 	// get validator set if number
 	if IsSprintStart(number+1, c.config.CalculateSprint(number)) {
-		newValidators, err := c.spanner.GetCurrentValidatorsByHash(context.Background(), header.ParentHash, number+1)
-		if err != nil {
-			return errUnknownValidators
+		var newValidators []*valset.Validator
+		var err error
+
+		// Tendermint에서 직접 검증자 목록을 가져옴
+		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			newValidators, err = c.TendermintClient.GetValidators(ctx)
+			if err != nil {
+				log.Warn("Failed to get validators from Tendermint, falling back to spanner",
+					"error", err,
+					"block", number)
+
+				// 실패 시 spanner로 폴백
+				newValidators, err = c.spanner.GetCurrentValidatorsByHash(context.Background(), header.ParentHash, number+1)
+				if err != nil {
+					return errUnknownValidators
+				}
+			} else {
+				log.Debug("Using Tendermint validators for block extra data",
+					"count", len(newValidators),
+					"block", number)
+			}
+		} else {
+			// Tendermint 연결 없이 spanner 사용
+			newValidators, err = c.spanner.GetCurrentValidatorsByHash(context.Background(), header.ParentHash, number+1)
+			if err != nil {
+				return errUnknownValidators
+			}
 		}
 
 		// sort validator by address
 		sort.Sort(valset.ValidatorsByAddress(newValidators))
 
-		if c.chainConfig.IsCancun(header.Number) {
+		if c.chainConfig.IsCancun(header.Number, number) {
 			var tempValidatorBytes []byte
 
 			for _, validator := range newValidators {
@@ -770,7 +828,7 @@ func (c *Eirene) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 				header.Extra = append(header.Extra, validator.HeaderBytes()...)
 			}
 		}
-	} else if c.chainConfig.IsCancun(header.Number) {
+	} else if c.chainConfig.IsCancun(header.Number, number) {
 		blockExtraData := &types.BlockExtraData{
 			ValidatorBytes: nil,
 			TxDependency:   nil,
@@ -828,45 +886,37 @@ func (c *Eirene) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		return
 	}
 
-	var (
-		stateSyncData []*types.StateSyncData
-		err           error
-	)
-
+	// 스프린트 시작 시점에만 상태 동기화 수행
 	if IsSprintStart(headerNumber, c.config.CalculateSprint(headerNumber)) {
 		start := time.Now()
 		cx := statefull.ChainContext{Chain: chain, Eirene: c}
-		// check and commit span
+
+		// Tendermint 클라이언트 연결 확인
+		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+			log.Info("Connected to Tendermint for state sync",
+				"block", headerNumber,
+				"tendermint_client", c.TendermintClient)
+		}
+
+		// 스팬 체크 및 커밋
 		if err := c.checkAndCommitSpan(stateDB, header, cx); err != nil {
 			log.Error("Error while committing span", "error", err)
 			return
 		}
 
 		if c.TendermintClient != nil {
-			// commit states
-			stateSyncData, err = c.CommitStates(stateDB, header, cx)
+			// 상태 커밋
+			stateSyncData, err := c.CommitStates(stateDB, header, cx)
 			if err != nil {
 				log.Error("Error while committing states", "error", err)
 				return
 			}
-		}
 
-		stateDB.AddEireneConsensusTime(time.Since(start))
-	}
-
-	if err = c.changeContractCodeIfNeeded(headerNumber, stateDB); err != nil {
-		log.Error("Error changing contract code", "error", err)
-		return
-	}
-
-	// No block rewards in PoA, so the state remains as is and uncles are dropped
-	header.Root = stateDB.IntermediateRoot(chain.Config().IsEIP158(header.Number))
-	header.UncleHash = types.CalcUncleHash(nil)
-
-	// Set state sync data to blockchain
-	if bc, ok := chain.(*core.BlockChain); ok {
-		if err := bc.AddStateSyncData(stateSyncData); err != nil {
-			log.Error("Failed to add state sync data", "error", err)
+			// 커밋된 상태 처리
+			log.Info("State sync completed at sprint start",
+				"block", headerNumber,
+				"sync_count", len(stateSyncData),
+				"duration", time.Since(start))
 		}
 	}
 }
@@ -1001,6 +1051,21 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
 	if err != nil {
 		return err
+	}
+
+	// Tendermint 검증자 세트를 확인하고 가능하면 사용
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(ctx)
+		if err == nil && validatorSet != nil {
+			// Tendermint 검증자 세트로 스냅샷 업데이트
+			snap.ValidatorSet = validatorSet
+			log.Debug("Using Tendermint validator set for sealing",
+				"validators", len(validatorSet.Validators),
+				"block", number)
+		}
 	}
 
 	// Bail out if we're unauthorized to sign a block
