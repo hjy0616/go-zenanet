@@ -218,24 +218,18 @@ func Difficulty(validatorSet *valset.ValidatorSet, signer common.Address) uint64
 		return 1
 	}
 
-	// PoS 시스템에서는 검증자가 맞는지 여부가 중요합니다
+	validators := validatorSet.Validators
 	proposer := validatorSet.GetProposer().Address
+	totalValidators := len(validators)
 
-	// 검증자 세트에 특정 서명자가 존재하는지 확인
-	_, found := validatorSet.GetByAddress(signer)
-	if found == nil {
-		// 검증자가 아니면 난이도는 가장 낮게 설정
-		return 1
+	proposerIndex, _ := validatorSet.GetByAddress(proposer)
+	signerIndex, _ := validatorSet.GetByAddress(signer)
+
+	// temp index
+	tempIndex := signerIndex
+	if tempIndex < proposerIndex {
+		tempIndex = tempIndex + totalValidators
 	}
 
-	// Tendermint 호환: 제안자인 경우 난이도를 가장 높게 설정 (2)
-	// 그렇지 않은 경우 일반 검증자로 취급 (1)
-	if proposer == signer {
-		return 2
-	}
-
-	// 제안자의 인덱스와 서명자의 인덱스를 이용하여 난이도를 결정
-	// PoS 블록체인에서는 모든 검증자가 동일한 권한으로 블록을 생성할 수 있으므로
-	// 단순화된 난이도 값을 사용합니다
-	return 1
+	return uint64(totalValidators - (tempIndex - proposerIndex))
 }
