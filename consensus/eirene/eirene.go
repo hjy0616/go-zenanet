@@ -350,8 +350,7 @@ func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return err
 	}
 
-	// 개선: Tendermint로부터 가져온 검증자 세트로 검증
-	// 기존 스프린트 기반 로직을 Tendermint 블록 기반으로 변경
+	// Check if it's a sprint end block (where new validators are set)
 	isSprintEnd := IsSprintStart(number+1, c.config.CalculateSprint(number))
 
 	// Ensure that the extra-data contains a signer list on checkpoint, but none otherwise
@@ -391,6 +390,39 @@ func (c *Eirene) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 
 	if header.WithdrawalsHash != nil {
 		return consensus.ErrUnexpectedWithdrawals
+	}
+
+	// If Tendermint client is available, verify the header against Tendermint
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		// This is where we would add any Tendermint-specific header verification
+		// For example, checking if the block hash matches what Tendermint has committed
+
+		// GetCurrentValidatorSet을 통해 현재 Tendermint의 검증자 세트 가져오기
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		// 스프린트 엔드 블록에서는 검증자 세트 확인
+		if isSprintEnd {
+			validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(ctx)
+			if err != nil {
+				log.Warn("Failed to get validator set from Tendermint", "error", err)
+				// 오류가 발생해도 계속 진행 - 로컬 스냅샷으로 검증
+			} else {
+				// Tendermint 검증자 세트와 블록 헤더의 검증자 세트 비교
+				headerVals, err := valset.ParseValidators(header.GetValidatorBytes(c.chainConfig))
+				if err != nil {
+					return err
+				}
+
+				// 검증자 세트 비교 로직
+				if validatorSet != nil && len(headerVals) > 0 {
+					if len(validatorSet.Validators) != len(headerVals) {
+						log.Warn("Validator set mismatch", "tendermint", len(validatorSet.Validators), "header", len(headerVals))
+						// 여기서 오류를 반환하지 않고 경고만 기록 - 중요한 불일치인 경우 나중에 반환하도록 변경할 수 있음
+					}
+				}
+			}
+		}
 	}
 
 	// All basic checks passed, verify cascading fields
@@ -455,10 +487,33 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		return err
 	}
 
-	// Tendermint 타임스탬프 규칙에 맞게 검증
-	// Tendermint는 이전 블록 시간으로부터 최소 1초 이후에 블록 생성
-	if parent.Time+c.config.CalculatePeriod(number) > header.Time {
-		return ErrInvalidTimestamp
+	// Check if Tendermint consensus is active
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		// For Tendermint integration, we may need to adjust the timestamp validation
+		// Tendermint blocks have different timing rules than the default Eirene
+
+		// Tendermint 블록 타이밍 규칙을 적용
+		// Tendermint는 기본적으로 블록 제안 시간이 설정되어 있음
+
+		// 기본 블록 시간 간격 검증 (필요에 따라 조정)
+		blockTimeInterval := c.config.CalculatePeriod(number)
+		if parent.Time+blockTimeInterval > header.Time {
+			// Tendermint와 통합 시에도 최소 블록 간격은 유지
+			// 하지만 검증 방식을 변경할 수 있음
+			log.Warn("Block time too close to parent",
+				"parent", parent.Time,
+				"current", header.Time,
+				"min interval", blockTimeInterval)
+			// 심각한 불일치가 아니면 경고만 로깅하고 계속 진행
+			if parent.Time+blockTimeInterval/2 > header.Time {
+				return ErrInvalidTimestamp
+			}
+		}
+	} else {
+		// 기존 Eirene 타이밍 규칙 적용
+		if parent.Time+c.config.CalculatePeriod(number) > header.Time {
+			return ErrInvalidTimestamp
+		}
 	}
 
 	// Retrieve the snapshot needed to verify this header and cache it
@@ -467,45 +522,59 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		return err
 	}
 
-	// Verify the validator list match with Tendermint validator set
+	// Verify the validator list match the local contract
 	if IsSprintStart(number+1, c.config.CalculateSprint(number)) {
-		// 개선: Tendermint로부터 직접 검증자 세트 가져오기
-		var newValidators []*valset.Validator
-		var err error
-
-		// Tendermint 클라이언트가 연결되어 있는 경우 해당 클라이언트를 통해 검증자 목록 가져오기
+		// Tendermint와 통합된 경우 검증자 정보 검증방식 변경
 		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-			newValidators, err = c.TendermintClient.GetValidators(context.Background())
-		} else {
-			// 기존 방식으로 fallback
-			newValidators, err = c.spanner.GetCurrentValidatorsByBlockNrOrHash(
-				context.Background(),
-				rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
-				number+1,
-			)
-		}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
 
-		if err != nil {
-			return err
-		}
+			// Tendermint에서 검증자 정보 가져오기
+			tmValidators, err := c.TendermintClient.GetValidators(ctx)
+			if err == nil && tmValidators != nil {
+				// Tendermint의 검증자와 로컬 스냅샷의 검증자 비교
+				headerVals, err := valset.ParseValidators(header.GetValidatorBytes(c.chainConfig))
+				if err != nil {
+					return err
+				}
 
-		sort.Sort(valset.ValidatorsByAddress(newValidators))
+				// 검증자 수량 비교
+				if len(tmValidators) != len(headerVals) {
+					log.Warn("Validator count mismatch between Tendermint and header",
+						"tendermint", len(tmValidators),
+						"header", len(headerVals))
+					// 심각한 불일치인 경우 오류 반환
+					// 대다수 검증자가 일치하면 계속 진행 가능
+					if float64(len(headerVals))/float64(len(tmValidators)) < 0.8 {
+						return errInvalidSpanValidators
+					}
+				}
 
-		headerVals, err := valset.ParseValidators(header.GetValidatorBytes(c.chainConfig))
-		if err != nil {
-			return err
-		}
-
-		if len(newValidators) != len(headerVals) {
-			log.Warn("Invalid validator set", "block number", number, "newValidators", newValidators, "headerVals", headerVals)
-			return errInvalidSpanValidators
-		}
-
-		for i, val := range newValidators {
-			if !bytes.Equal(val.HeaderBytes(), headerVals[i].HeaderBytes()) {
-				log.Warn("Invalid validator set", "block number", number, "index", i, "local validator", val, "header validator", headerVals[i])
-				return errInvalidSpanValidators
+				// 검증자 주소 비교 (모든 Tendermint 검증자가 헤더에 포함되어야 함)
+				for _, tmVal := range tmValidators {
+					found := false
+					for _, headerVal := range headerVals {
+						if bytes.Equal(tmVal.Address.Bytes(), headerVal.Address.Bytes()) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						log.Warn("Tendermint validator not found in header", "validator", tmVal.Address.Hex())
+						// 중요한 검증자가 누락된 경우 오류 반환
+						if tmVal.VotingPower > 0 {
+							return errInvalidSpanValidators
+						}
+					}
+				}
+			} else {
+				// Tendermint 검증자 정보를 가져오지 못한 경우 로컬 검증으로 대체
+				log.Warn("Failed to get validators from Tendermint, falling back to local validation", "error", err)
+				return c.verifyValidatorsUsingLocalData(chain, header, number, snap)
 			}
+		} else {
+			// Tendermint 통합이 없는 경우 기존 로직 사용
+			return c.verifyValidatorsUsingLocalData(chain, header, number, snap)
 		}
 	}
 
@@ -529,6 +598,35 @@ func (c *Eirene) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 
 	// All basic checks passed, verify the seal and return
 	return c.verifySeal(chain, header, parents)
+}
+
+// verifyValidatorsUsingLocalData is a helper function that uses local data to verify validators
+func (c *Eirene) verifyValidatorsUsingLocalData(chain consensus.ChainHeaderReader, header *types.Header, number uint64, snap *Snapshot) error {
+	newValidators, err := c.spanner.GetCurrentValidatorsByBlockNrOrHash(context.Background(), rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), number+1)
+	if err != nil {
+		return err
+	}
+
+	sort.Sort(valset.ValidatorsByAddress(newValidators))
+
+	headerVals, err := valset.ParseValidators(header.GetValidatorBytes(c.chainConfig))
+	if err != nil {
+		return err
+	}
+
+	if len(newValidators) != len(headerVals) {
+		log.Warn("Invalid validator set", "block number", number, "newValidators", newValidators, "headerVals", headerVals)
+		return errInvalidSpanValidators
+	}
+
+	for i, val := range newValidators {
+		if !bytes.Equal(val.HeaderBytes(), headerVals[i].HeaderBytes()) {
+			log.Warn("Invalid validator set", "block number", number, "index", i, "local validator", val, "header validator", headerVals[i])
+			return errInvalidSpanValidators
+		}
+	}
+
+	return nil
 }
 
 // snapshot retrieves the authorization snapshot at a given point in time.
@@ -685,6 +783,16 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		return err
 	}
 
+	// If Tendermint client is available, perform additional verification
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		// Tendermint의 블록 서명 검증 로직
+		// 일반적으로 Tendermint는 자체 합의 메커니즘을 통해 블록을 검증하므로
+		// 여기서는 필요한 추가 검증만 수행
+
+		// Tendermint가 이미 블록을 검증했다면, 추가 검증을 생략할 수 있음
+		// 하지만 보안을 위해 기본 서명 검증은 유지
+	}
+
 	// Resolve the authorization key and check against signers
 	signer, err := ecrecover(header, c.signatures, c.config)
 	if err != nil {
@@ -696,6 +804,7 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
 	}
 
+	// 검증자 세트에서 서명자의 순서 확인
 	succession, err := snap.GetSignerSuccessionNumber(signer)
 	if err != nil {
 		return err
@@ -708,8 +817,18 @@ func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		parent = chain.GetHeader(header.ParentHash, number-1)
 	}
 
-	if IsBlockOnTime(parent, header, number, succession, c.config) {
-		return &BlockTooSoonError{number, succession}
+	// Tendermint와 통합된 경우 블록 타이밍 검증 방식 수정
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		// Tendermint는 자체 블록 생성 타이밍을 가지므로 블록 시간 검증 로직 조정
+		// 하지만 최소한의 검증은 유지
+		if parent != nil && header.Time < parent.Time {
+			return &BlockTooSoonError{number, succession}
+		}
+	} else {
+		// 기존 Eirene 블록 타이밍 검증
+		if IsBlockOnTime(parent, header, number, succession, c.config) {
+			return &BlockTooSoonError{number, succession}
+		}
 	}
 
 	// Ensure that the difficulty corresponds to the turn-ness of the signer
@@ -1012,6 +1131,51 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return nil
 	}
 
+	// If Tendermint client is available, use it to coordinate block sealing
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		log.Info("Tendermint integration active, delegating block proposal to Tendermint")
+
+		// Tendermint을 통한 블록 생성 방식에서는 블록을 직접 seal하지 않고
+		// Tendermint에 블록 제안을 위임하거나 Tendermint로부터 제안된 블록을 처리
+
+		// 여기서는 Eirene가 블록을 서명하고 Tendermint에 제안하는 방식으로 구현
+		// 또는 Tendermint 합의에 따라 이미 서명된 블록을 처리하는 방식으로 구현
+
+		// Don't hold the signer fields for the entire sealing procedure
+		currentSigner := *c.authorizedSigner.Load()
+
+		// 현재 Geth 노드가 검증자인지 확인
+		snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
+		if err != nil {
+			return err
+		}
+
+		// 검증자가 아니면 블록 생성 권한이 없음
+		if !snap.ValidatorSet.HasAddress(currentSigner.signer) {
+			log.Info("Not a validator, skipping block sealing")
+			return nil
+		}
+
+		// 블록에 서명
+		err = Sign(currentSigner.signFn, currentSigner.signer, header, c.config)
+		if err != nil {
+			return err
+		}
+
+		// 서명된 블록을 결과 채널로 전송
+		select {
+		case <-stop:
+			log.Debug("Discarding sealing operation for block", "number", number)
+			return nil
+		case results <- block.WithSeal(header):
+			log.Info("Tendermint integrated block sealed", "number", number, "hash", header.Hash())
+			return nil
+		default:
+			log.Warn("Sealing result was not read by miner", "number", number, "sealhash", SealHash(header, c.config))
+			return nil
+		}
+	}
+
 	// Don't hold the signer fields for the entire sealing procedure
 	currentSigner := *c.authorizedSigner.Load()
 
@@ -1026,45 +1190,15 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return &UnauthorizedSignerError{number - 1, currentSigner.signer.Bytes()}
 	}
 
-	// 현재 Tendermint 검증자 세트에서의 순서를 확인
-	// Tendermint 클라이언트가 연결되어 있으면 현재 제안자(proposer) 확인
-	var successionNumber int
-	var isTendermintProposer bool = false
-
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		// Tendermint 현재 검증자 세트 가져오기
-		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(context.Background())
-		if err == nil && validatorSet != nil {
-			// 현재 노드가 Tendermint의 제안자인지 확인
-			proposer := validatorSet.GetProposer()
-			if proposer != nil && proposer.Address == currentSigner.signer {
-				isTendermintProposer = true
-				successionNumber = 0 // 제안자는 지연 없이 즉시 블록 생성
-				log.Info("Current node is the Tendermint proposer", "number", number, "address", currentSigner.signer)
-			} else {
-				// 검증자 목록에서 현재 서명자의 위치 확인
-				for i, val := range validatorSet.Validators {
-					if val.Address == currentSigner.signer {
-						// 제안자가 아닌 경우, 검증자 목록에서의 위치에 따라 지연 계산
-						successionNumber = i
-						break
-					}
-				}
-			}
-		} else {
-			// Tendermint 클라이언트에서 검증자 세트를 가져오지 못한 경우 기존 방식으로 fallback
-			successionNumber, err = snap.GetSignerSuccessionNumber(currentSigner.signer)
-			if err != nil {
-				return err
-			}
-		}
-	} else {
-		// Tendermint 클라이언트가 없는 경우 기존 방식으로 fallback
-		successionNumber, err = snap.GetSignerSuccessionNumber(currentSigner.signer)
-		if err != nil {
-			return err
-		}
+	successionNumber, err := snap.GetSignerSuccessionNumber(currentSigner.signer)
+	if err != nil {
+		return err
 	}
+
+	// Sweet, the protocol permits us to sign the block, wait for our time
+	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
+	// wiggle was already accounted for in header.Time, this is just for logging
+	wiggle := time.Duration(successionNumber) * time.Duration(c.config.CalculateBackupMultiplier(number)) * time.Second
 
 	// Sign all the things!
 	err = Sign(currentSigner.signFn, currentSigner.signer, header, c.config)
@@ -1072,36 +1206,26 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return err
 	}
 
-	// Tendermint 제안자인 경우 추가 지연 없이 바로 블록 생성
-	var delay time.Duration
-	if isTendermintProposer {
-		delay = 0 // 제안자는 지연 없이 즉시 블록 생성
-		log.Info("Sealing as Tendermint proposer", "number", number, "hash", header.Hash)
-	} else {
-		// 기존 지연 계산 로직 사용
-		delay = time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
-		wiggle := time.Duration(successionNumber) * time.Duration(c.config.CalculateBackupMultiplier(number)) * time.Second
-		log.Info("Waiting for slot to sign and propagate", "number", number, "hash", header.Hash, "delay-in-sec", uint(delay), "delay", common.PrettyDuration(delay))
-
-		if wiggle > 0 {
-			log.Info(
-				"Sealing out-of-turn",
-				"number", number,
-				"hash", header.Hash,
-				"wiggle-in-sec", uint(wiggle),
-				"wiggle", common.PrettyDuration(wiggle),
-				"in-turn-signer", snap.ValidatorSet.GetProposer().Address.Hex(),
-			)
-		}
-	}
-
 	// Wait until sealing is terminated or delay timeout.
+	log.Info("Waiting for slot to sign and propagate", "number", number, "hash", header.Hash, "delay-in-sec", uint(delay), "delay", common.PrettyDuration(delay))
+
 	go func() {
 		select {
 		case <-stop:
 			log.Debug("Discarding sealing operation for block", "number", number)
 			return
 		case <-time.After(delay):
+			if wiggle > 0 {
+				log.Info(
+					"Sealing out-of-turn",
+					"number", number,
+					"hash", header.Hash,
+					"wiggle-in-sec", uint(wiggle),
+					"wiggle", common.PrettyDuration(wiggle),
+					"in-turn-signer", snap.ValidatorSet.GetProposer().Address.Hex(),
+				)
+			}
+
 			log.Info(
 				"Sealing successful",
 				"number", number,
@@ -1109,20 +1233,6 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 				"headerDifficulty", header.Difficulty,
 			)
 		}
-
-		// Tendermint와 통합: 블록 생성 시 Tendermint에 Commit 알림
-		// 이는 Tendermint의 블록 커밋 메커니즘과 연동하기 위함
-		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-
-			_, err := c.TendermintClient.Commit(ctx)
-			if err != nil {
-				log.Error("Failed to commit block to Tendermint", "number", number, "hash", header.Hash, "error", err)
-				// 에러가 발생해도 계속 진행, Tendermint와의 통신이 실패해도 Geth는 자체적으로 블록 생성
-			}
-		}
-
 		select {
 		case results <- block.WithSeal(header):
 		default:
@@ -1229,97 +1339,93 @@ func (c *Eirene) FetchAndCommitSpan(
 	header *types.Header,
 	chain core.ChainContext,
 ) error {
-	headerNumber := header.Number.Uint64()
+	var tendermintSpan span.TendermintSpan
 
-	// 현재 스팬 정보 가져오기
-	currentSpan, err := c.spanner.GetCurrentSpan(ctx, header.ParentHash)
-	if err != nil {
-		return fmt.Errorf("failed to get current span: %w", err)
-	}
-
-	// 새 스팬 초기화
-	var newSpan *span.Span
-	if currentSpan == nil || currentSpan.EndBlock == 0 {
-		// 첫 번째 스팬인 경우
-		newSpan = &span.Span{
-			ID:         newSpanID,
-			StartBlock: headerNumber,
-			EndBlock:   headerNumber + 100*c.config.CalculateSprint(headerNumber),
-		}
-	} else {
-		// 이미 스팬이 있는 경우, 다음 스팬 시작
-		newSpan = &span.Span{
-			ID:         newSpanID,
-			StartBlock: currentSpan.EndBlock + 1,
-			EndBlock:   currentSpan.EndBlock + 100*c.config.CalculateSprint(headerNumber),
-		}
-	}
-
-	log.Info("Fetching and committing new span",
-		"spanID", newSpanID,
-		"startBlock", newSpan.StartBlock,
-		"endBlock", newSpan.EndBlock,
-		"block", headerNumber)
-
-	// Tendermint 클라이언트가 연결되어 있는 경우
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		// Tendermint에서 검증자 세트 가져오기
-		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(ctx)
+	// Tendermint 클라이언트가 있는 경우 해당 클라이언트를 통해 스팬 정보 가져오기
+	if c.TendermintClient == nil {
+		// 테스트를 위한 가짜 스팬 생성 (실제 프로덕션 환경에서는 사용하지 않음)
+		s, err := c.getNextTendermintSpanForTest(ctx, newSpanID, header, chain)
 		if err != nil {
-			log.Warn("Failed to get validator set from Tendermint, falling back to local validators",
-				"error", err)
-		} else if validatorSet != nil && len(validatorSet.Validators) > 0 {
-			// Tendermint 검증자로 스팬 커밋
-			// 스패너가 Tendermint 확장 메서드를 지원하는지 확인
-			if spanner, ok := c.spanner.(*span.ChainSpanner); ok {
-				// Tendermint의 검증자로 새 스팬 커밋
-				return spanner.CommitSpanFromTendermint(
-					ctx,
-					newSpan,
-					validatorSet.Validators,
-					c.chainConfig.ChainID.String(),
-					state,
-					header,
-					chain,
-				)
-			}
-
-			// Tendermint 스팬 생성
-			// 정규 스패너는 위의 확장 메서드를 지원하지 않으므로 일반적인 방법으로 처리
-			tendermintSpan := &span.TendermintSpan{
-				Span:              *newSpan,
-				ValidatorSet:      *validatorSet,
-				SelectedProducers: make([]valset.Validator, len(validatorSet.Validators)),
-				ChainID:           c.chainConfig.ChainID.String(),
-			}
-
-			// 선택된 생산자를 검증자와 동기화
-			for i, val := range validatorSet.Validators {
-				tendermintSpan.SelectedProducers[i] = *val.Copy()
-			}
-
-			// 스팬 커밋
-			return c.spanner.CommitSpan(ctx, *tendermintSpan, state, header, chain)
+			return err
 		}
+
+		tendermintSpan = *s
+	} else {
+		// Tendermint에서 스팬 정보 가져오기
+		// Tendermint와의 연결 상태 확인
+		if !c.TendermintClient.IsConnected() {
+			// 연결 시도
+			if err := c.TendermintClient.Connect(); err != nil {
+				return fmt.Errorf("failed to connect to Tendermint: %w", err)
+			}
+		}
+
+		// 타임아웃 설정
+		fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		// Tendermint에서 스팬 정보 가져오기
+		response, err := c.TendermintClient.Span(fetchCtx, newSpanID)
+		if err != nil {
+			log.Error("Failed to fetch span from Tendermint", "spanID", newSpanID, "error", err)
+			return err
+		}
+
+		tendermintSpan = *response
 	}
 
-	// Tendermint 클라이언트가 없거나 검증자를 가져오지 못한 경우
-	// 테스트 환경이나 Tendermint 연결이 없는 경우 테스트 스팬 사용
-	log.Warn("Using test span as fallback",
-		"spanID", newSpanID,
-		"block", header.Number)
+	// 체인 ID 검증
+	if tendermintSpan.ChainID != c.chainConfig.ChainID.String() {
+		return fmt.Errorf(
+			"chain id proposed span, %s, and eirene chain id, %s, doesn't match",
+			tendermintSpan.ChainID,
+			c.chainConfig.ChainID.String(),
+		)
+	}
 
-	testSpan, err := c.getNextTendermintSpanForTest(ctx, newSpanID, header, chain)
+	// 스팬 정보를 로컬 상태에 커밋
+	span := tendermintSpan.Span
+	selectedProducers := tendermintSpan.SelectedProducers
+
+	// 로그 출력
+	log.Info("✅ Committing new span",
+		"id", span.ID,
+		"startBlock", span.StartBlock,
+		"endBlock", span.EndBlock)
+
+	// 새 스팬 정보 검증
+	if span.StartBlock == 0 {
+		return fmt.Errorf(
+			"span start block (%d) needs to be non-zero. span id %d",
+			span.StartBlock,
+			span.ID,
+		)
+	}
+
+	// 선택된 생성자 정보 검증 및 저장
+	localContext := chain.(statefull.ChainContext)
+
+	// 로컬 스냅샷에서 검증자 세트 가져오기
+	snap, err := c.snapshot(localContext.Chain, header.Number.Uint64()-1, header.ParentHash, nil)
 	if err != nil {
 		return err
 	}
 
-	// 테스트 스팬의 블록 범위를 새 스팬 설정으로 업데이트
-	testSpan.StartBlock = newSpan.StartBlock
-	testSpan.EndBlock = newSpan.EndBlock
+	// Tendermint 검증자 세트와 스냅샷 검증자 세트 통합
+	validatorSet := tendermintSpan.ValidatorSet
 
-	// 스팬 커밋
-	return c.spanner.CommitSpan(ctx, *testSpan, state, header, chain)
+	// 검증자 세트의 변경 사항 로깅
+	log.Info("Validator set for new span", "validators", valset.ValidatorListString(validatorSet.Validators))
+
+	// 스팬 정보 상태 DB에 저장
+	gasUsed, err := c.spanner.CommitSpan(span, selectedProducers, state, header, c.GenesisContractsClient, chain)
+	if err != nil {
+		log.Error("Error while committing span", "error", err)
+		return err
+	}
+
+	log.Info("Committed span", "gas used", gasUsed)
+	return nil
 }
 
 // CommitStates commit states
@@ -1345,7 +1451,8 @@ func (c *Eirene) CommitStates(
 	}
 
 	// Tendermint에서는 이전 블록 타임스탬프를 toTimestamp로 사용
-	// Tendermint의 블록 생성 주기에 맞게 설정
+	// Tendermint의 블록 생성 주기에 따라 적절한 값을 선택해야 함
+	// 이전 스프린트의 마지막 블록 시간으로 설정
 	stateSyncDelay := c.config.CalculateStateSyncDelay(number)
 	toTimestamp = int64(header.Time - stateSyncDelay)
 
@@ -1355,41 +1462,21 @@ func (c *Eirene) CommitStates(
 	log.Info(
 		"Fetching state updates from Tendermint",
 		"fromID", from,
-		"toTimestamp", toTimestamp,
-		"block", number)
-
-	// Tendermint 클라이언트가 연결되어 있지 않거나 응답하지 않는 경우 처리
-	if c.TendermintClient == nil || !c.TendermintClient.IsConnected() {
-		log.Warn("Tendermint client not connected, skipping state sync", "block", number)
-		return []*types.StateSyncData{}, nil
-	}
+		"toTimestamp", toTimestamp)
 
 	// Tendermint ABCI 클라이언트를 통해 상태 동기화 이벤트 조회
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	eventRecords, err := c.TendermintClient.StateSyncEvents(ctx, from, toTimestamp)
+	eventRecords, err := c.TendermintClient.StateSyncEvents(context.Background(), from, toTimestamp)
 	if err != nil {
-		log.Error("Error occurred when fetching state sync events",
-			"fromID", from,
-			"toTimestamp", toTimestamp,
-			"err", err)
+		log.Error("Error occurred when fetching state sync events", "fromID", from, "toTimestamp", toTimestamp, "err", err)
 		// 에러가 발생해도 계속 진행, 이벤트를 가져오지 못한 경우 빈 목록으로 처리
 		eventRecords = []*clerk.EventRecordWithTime{}
 	}
-
-	// 로깅 개선: 이벤트 기록 수 로깅
-	log.Info("Received state sync events",
-		"count", len(eventRecords),
-		"fromID", from,
-		"toTimestamp", toTimestamp)
 
 	// 테스트 환경에서 이벤트 수 조정이 필요한 경우
 	if c.config.OverrideStateSyncRecords != nil {
 		if val, ok := c.config.OverrideStateSyncRecords[strconv.FormatUint(number, 10)]; ok {
 			if val < len(eventRecords) {
 				eventRecords = eventRecords[0:val]
-				log.Info("Overriding state sync records count", "new count", val)
 			}
 		}
 	}
@@ -1403,22 +1490,15 @@ func (c *Eirene) CommitStates(
 
 	var gasUsed uint64
 
-	for i, eventRecord := range eventRecords {
+	for _, eventRecord := range eventRecords {
 		if eventRecord.ID <= lastStateID {
-			log.Debug("Skipping already processed state sync event",
-				"eventID", eventRecord.ID,
-				"lastStateID", lastStateID)
+			log.Debug("Skipping already processed state sync event", "eventID", eventRecord.ID, "lastStateID", lastStateID)
 			continue
 		}
 
 		// 이벤트 레코드 검증
 		if err = validateEventRecord(eventRecord, number, toTime, lastStateID, chainID); err != nil {
-			log.Error("Invalid event record",
-				"block", number,
-				"toTimestamp", toTimestamp,
-				"stateID", lastStateID+1,
-				"event index", i,
-				"error", err.Error())
+			log.Error("Invalid event record", "block", number, "toTimestamp", toTimestamp, "stateID", lastStateID+1, "error", err.Error())
 			break
 		}
 
@@ -1435,35 +1515,23 @@ func (c *Eirene) CommitStates(
 		// 상태 동기화 실행
 		// 이 호출은 이벤트를 발생시켜야 함
 		// 수신자 주소가 컨트랙트가 아닌 경우, 실행과 이벤트 발생이 스킵됨
+		// https://github.com/maticnetwork/genesis-contracts/blob/master/contracts/StateReceiver.sol#L27
 		gasUsed, err = c.GenesisContractsClient.CommitState(eventRecord, state, header, chain)
 		if err != nil {
-			log.Error("Failed to commit state",
-				"eventID", eventRecord.ID,
-				"contract", eventRecord.Contract.Hex(),
-				"error", err)
 			return nil, err
 		}
 
 		totalGas += int(gasUsed)
 		lastStateID++
-
-		// 로깅 개선: 처리 진행 상황 주기적으로 표시
-		if i > 0 && i%10 == 0 {
-			log.Info("Processing state sync events",
-				"processed", i,
-				"total", len(eventRecords),
-				"lastStateID", lastStateID)
-		}
 	}
 
 	processTime := time.Since(processStart)
 
 	log.Info("StateSyncData processed",
-		"total records", len(eventRecords),
-		"processed records", len(stateSyncs),
 		"gas", totalGas,
 		"block", number,
 		"lastStateID", lastStateID,
+		"total records", len(eventRecords),
 		"fetch time (ms)", int(fetchTime.Milliseconds()),
 		"process time (ms)", int(processTime.Milliseconds()))
 

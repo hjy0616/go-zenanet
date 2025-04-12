@@ -21,7 +21,7 @@ type BlockExtraData struct {
 
 // Header.Extra = extraVanity + validatorBytes + extraSeal
 func (h *Header) GetValidatorBytes(config *params.ChainConfig) []byte {
-	if config.IsCancun(h.Number, h.Time) {
+	if config.IsCancun(h.Number, 0) {
 		if len(h.Extra) < ExtraVanityLength+ExtraSealLength {
 			return []byte{}
 		}

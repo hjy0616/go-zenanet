@@ -1094,11 +1094,6 @@ type EireneConfig struct {
 	JaipurBlock       *big.Int               `json:"jaipurBlock,omitempty"`
 	BlockAlloc        map[string]interface{} `json:"blockAlloc,omitempty"`        // Block allocation for contract bytecode updates
 	ValidatorContract string                 `json:"validatorContract,omitempty"` // Address of validator contract
-
-	// StateSyncDelay specifies the delay in seconds for state sync events
-	StateSyncDelay uint64 `json:"stateSyncDelay,omitempty"`
-	// OverrideStateSyncRecords is used to override state sync records count in test environments
-	OverrideStateSyncRecords map[string]int `json:"overrideStateSyncRecords,omitempty"`
 }
 
 // String implements the stringer interface, returning the consensus engine details.
@@ -1142,13 +1137,4 @@ func (c *EireneConfig) CalculateBackupMultiplier(num uint64) uint64 {
 // IsJaipur returns whether num is either equal to the Jaipur block or greater.
 func (c *EireneConfig) IsJaipur(num *big.Int) bool {
 	return isBlockForked(c.JaipurBlock, num)
-}
-
-// CalculateStateSyncDelay calculates the state sync delay for a given block number
-func (c *EireneConfig) CalculateStateSyncDelay(num uint64) uint64 {
-	if c.StateSyncDelay > 0 {
-		return c.StateSyncDelay
-	}
-	// Default to 60 seconds if not specified
-	return 60
 }
