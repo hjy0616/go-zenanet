@@ -78,9 +78,8 @@ type ITendermintClient interface {
 	GetValidators(ctx context.Context) ([]*valset.Validator, error)
 	GetCurrentValidatorSet(ctx context.Context) (*valset.ValidatorSet, error)
 
-	// BlockInfo 메서드는 주어진 블록 높이의 Tendermint 블록 정보를 조회합니다.
-	// height가 nil이면 최신 블록 정보를 반환합니다.
-	BlockInfo(ctx context.Context, height *int64) (*span.TendermintBlock, error)
+	// 블록 정보 조회 메서드 추가
+	BlockInfo(ctx context.Context, height *int64) (*BlockInfo, error)
 
 	Connect() error
 	IsConnected() bool

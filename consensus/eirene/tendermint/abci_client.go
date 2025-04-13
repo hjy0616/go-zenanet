@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,12 +16,14 @@ import (
 	tmrpc "github.com/tendermint/tendermint/rpc/client/http"
 
 	"github.com/zenanetwork/go-zenanet/common"
+	"github.com/zenanetwork/go-zenanet/consensus/eirene"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/clerk"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/tendermint/checkpoint"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/tendermint/milestone"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/tendermint/span"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/valset"
 	"github.com/zenanetwork/go-zenanet/log"
+	"github.com/zenanetwork/go-zenanet/metrics"
 )
 
 var (
@@ -36,6 +39,24 @@ const (
 	// Dial retry delay
 	dialRetryDelay = 3 * time.Second
 )
+
+// requestType은 메트릭에 사용되는 요청 유형을 나타냅니다.
+type requestType string
+
+const (
+	stateSyncRequest       requestType = "state-sync"
+	spanRequest            requestType = "span"
+	checkpointRequest      requestType = "checkpoint"
+	checkpointCountRequest requestType = "checkpoint-count"
+	milestoneRequest       requestType = "milestone"
+	milestoneCountRequest  requestType = "milestone-count"
+)
+
+// requestMetrics는 각 요청 유형의 메트릭을 담는 구조체입니다.
+type requestMetrics struct {
+	meter map[bool]metrics.Meter
+	timer metrics.Timer
+}
 
 // TendermintABCIClient implements the ITendermintClient interface for communication with Tendermint via ABCI
 type TendermintABCIClient struct {
@@ -310,70 +331,214 @@ func (c *TendermintABCIClient) GetCurrentValidatorSet(ctx context.Context) (*val
 	return validatorSet, nil
 }
 
-// StateSyncEvents는 특정 ID부터 지정된 블록까지의 상태 동기화 이벤트를 검색합니다.
-func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint64, to int64) ([]*clerk.EventRecordWithTime, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+// ReconnectIfNeeded는 연결이 끊어진 경우 ABCI 및 RPC 클라이언트를 재연결합니다.
+func (c *TendermintABCIClient) ReconnectIfNeeded() error {
+	var connectErrors []error
 
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
-	}
+	// ABCI 연결 확인 및 필요시 재연결
+	c.abciMutex.RLock()
+	abciConnected := c.isABCIConnected
+	c.abciMutex.RUnlock()
 
-	// Tendermint RPC를 통해 이벤트 조회
-	// 여기서는 tx_search를 사용하여 특정 타입의 이벤트를 조회합니다
-	query := fmt.Sprintf("state_sync.from_id >= %d AND state_sync.to_block <= %d", fromID, to)
-	searchResult, err := c.rpcClient.TxSearch(ctx, query, false, nil, nil, "asc")
-	if err != nil {
-		return nil, fmt.Errorf("failed to search state sync events: %w", err)
-	}
-
-	// 결과를 EventRecordWithTime 형태로 변환
-	events := make([]*clerk.EventRecordWithTime, 0, len(searchResult.Txs))
-	for _, tx := range searchResult.Txs {
-		// 각 트랜잭션에서 이벤트 데이터 추출
-		for _, event := range tx.TxResult.Events {
-			if event.Type != "state_sync" {
-				continue
-			}
-
-			// 이벤트 속성에서 필요한 데이터 추출
-			var id uint64
-			var stateID uint64
-			var recordTime time.Time
-			var data []byte
-
-			for _, attr := range event.Attributes {
-				key := string(attr.Key)
-				value := attr.Value
-
-				switch key {
-				case "id":
-					id, _ = strconv.ParseUint(string(value), 10, 64)
-				case "state_id":
-					stateID, _ = strconv.ParseUint(string(value), 10, 64)
-				case "time":
-					timeInt, _ := strconv.ParseInt(string(value), 10, 64)
-					recordTime = time.Unix(timeInt, 0)
-				case "data":
-					data = value
-				}
-			}
-
-			// EventRecordWithTime 생성 및 추가
-			record := &clerk.EventRecord{
-				ID:      id,
-				StateID: stateID,
-				Data:    data,
-			}
-			eventWithTime := &clerk.EventRecordWithTime{
-				EventRecord: record,
-				RecordTime:  recordTime,
-			}
-			events = append(events, eventWithTime)
+	if !abciConnected {
+		if err := c.connectABCI(); err != nil {
+			connectErrors = append(connectErrors, fmt.Errorf("ABCI reconnect failed: %w", err))
+		} else {
+			log.Info("Successfully reconnected to ABCI endpoint", "address", c.abciAddr)
 		}
 	}
 
-	return events, nil
+	// RPC 연결 확인 및 필요시 재연결
+	c.rpcMutex.RLock()
+	rpcConnected := c.isRPCConnected
+	c.rpcMutex.RUnlock()
+
+	if !rpcConnected {
+		if err := c.connectRPC(); err != nil {
+			connectErrors = append(connectErrors, fmt.Errorf("RPC reconnect failed: %w", err))
+		} else {
+			log.Info("Successfully reconnected to RPC endpoint", "address", c.rpcAddr)
+		}
+	}
+
+	// 에러 통합 및 반환
+	if len(connectErrors) > 0 {
+		errMsgs := make([]string, len(connectErrors))
+		for i, err := range connectErrors {
+			errMsgs[i] = err.Error()
+		}
+		return fmt.Errorf("reconnection errors: %s", strings.Join(errMsgs, "; "))
+	}
+
+	return nil
+}
+
+// 클라이언트 메트릭 정의를 전역으로 이동
+var clientMetrics = map[requestType]*requestMetrics{
+	stateSyncRequest: {
+		meter: map[bool]metrics.Meter{
+			true:  metrics.NewRegisteredMeter("client/requests/statesync/valid", nil),
+			false: metrics.NewRegisteredMeter("client/requests/statesync/invalid", nil),
+		},
+		timer: metrics.NewRegisteredTimer("client/requests/statesync/duration", nil),
+	},
+	spanRequest: {
+		meter: map[bool]metrics.Meter{
+			true:  metrics.NewRegisteredMeter("client/requests/span/valid", nil),
+			false: metrics.NewRegisteredMeter("client/requests/span/invalid", nil),
+		},
+		timer: metrics.NewRegisteredTimer("client/requests/span/duration", nil),
+	},
+	checkpointRequest: {
+		meter: map[bool]metrics.Meter{
+			true:  metrics.NewRegisteredMeter("client/requests/checkpoint/valid", nil),
+			false: metrics.NewRegisteredMeter("client/requests/checkpoint/invalid", nil),
+		},
+		timer: metrics.NewRegisteredTimer("client/requests/checkpoint/duration", nil),
+	},
+	checkpointCountRequest: {
+		meter: map[bool]metrics.Meter{
+			true:  metrics.NewRegisteredMeter("client/requests/checkpointcount/valid", nil),
+			false: metrics.NewRegisteredMeter("client/requests/checkpointcount/invalid", nil),
+		},
+		timer: metrics.NewRegisteredTimer("client/requests/checkpointcount/duration", nil),
+	},
+	milestoneRequest: {
+		meter: map[bool]metrics.Meter{
+			true:  metrics.NewRegisteredMeter("client/requests/milestone/valid", nil),
+			false: metrics.NewRegisteredMeter("client/requests/milestone/invalid", nil),
+		},
+		timer: metrics.NewRegisteredTimer("client/requests/milestone/duration", nil),
+	},
+	milestoneCountRequest: {
+		meter: map[bool]metrics.Meter{
+			true:  metrics.NewRegisteredMeter("client/requests/milestonecount/valid", nil),
+			false: metrics.NewRegisteredMeter("client/requests/milestonecount/invalid", nil),
+		},
+		timer: metrics.NewRegisteredTimer("client/requests/milestonecount/duration", nil),
+	},
+}
+
+// StateSyncEvents는 특정 ID부터 지정된 블록까지의 상태 동기화 이벤트를 검색합니다.
+func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint64, to int64) ([]*clerk.EventRecordWithTime, error) {
+	maxRetries := 3
+	var lastErr error
+
+	// ReconnectIfNeeded 호출로 연결 상태 확인 및 재연결 시도
+	if err := c.ReconnectIfNeeded(); err != nil {
+		log.Warn("Failed to reconnect for state sync fetch", "error", err)
+	}
+
+	for i := 0; i < maxRetries; i++ {
+		c.rpcMutex.RLock()
+		isConnected := c.isRPCConnected
+		c.rpcMutex.RUnlock()
+
+		if !isConnected {
+			lastErr = ErrRPCNotConnected
+			log.Warn("RPC not connected when fetching state sync events", "attempt", i+1, "max", maxRetries)
+
+			// 연결 시도
+			if err := c.connectRPC(); err != nil {
+				lastErr = fmt.Errorf("failed to connect to RPC for state sync fetch: %w", err)
+				time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+				continue
+			}
+		}
+
+		// 메트릭을 위한 컨텍스트 설정
+		ctx = withRequestType(ctx, stateSyncRequest)
+		startTime := time.Now()
+
+		// Tendermint RPC를 통해 이벤트 조회
+		query := fmt.Sprintf("state_sync.from_id >= %d AND state_sync.to_block <= %d", fromID, to)
+		searchResult, err := c.rpcClient.TxSearch(ctx, query, false, nil, nil, "asc")
+
+		// 요청 메트릭 기록
+		isSuccess := err == nil
+		sendMetrics(ctx, startTime, isSuccess)
+
+		if err != nil {
+			lastErr = fmt.Errorf("failed to search state sync events: %w", err)
+			log.Warn("State sync query failed", "attempt", i+1, "max", maxRetries, "error", err)
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		// 결과를 EventRecordWithTime 형태로 변환
+		events := make([]*clerk.EventRecordWithTime, 0, len(searchResult.Txs))
+		for _, tx := range searchResult.Txs {
+			// 각 트랜잭션에서 이벤트 데이터 추출
+			for _, event := range tx.TxResult.Events {
+				if event.Type != "state_sync" {
+					continue
+				}
+
+				// 이벤트 속성에서 필요한 데이터 추출
+				var id uint64
+				var stateID uint64
+				var recordTime time.Time
+				var data []byte
+				var contract common.Address
+				var txHash common.Hash
+				var chainID string
+
+				for _, attr := range event.Attributes {
+					key := string(attr.Key)
+					value := attr.Value
+
+					switch key {
+					case "id":
+						id, _ = strconv.ParseUint(string(value), 10, 64)
+					case "state_id":
+						stateID, _ = strconv.ParseUint(string(value), 10, 64)
+					case "time":
+						timeInt, _ := strconv.ParseInt(string(value), 10, 64)
+						recordTime = time.Unix(timeInt, 0)
+					case "data":
+						data = value
+					case "contract":
+						if len(value) >= common.AddressLength {
+							copy(contract[:], value[:common.AddressLength])
+						}
+					case "tx_hash":
+						if len(value) >= common.HashLength {
+							copy(txHash[:], value[:common.HashLength])
+						}
+					case "chain_id":
+						chainID = string(value)
+					}
+				}
+
+				// EventRecordWithTime 생성 및 추가
+				record := &clerk.EventRecord{
+					ID:       id,
+					StateID:  stateID,
+					Data:     data,
+					Contract: contract,
+					TxHash:   txHash,
+					ChainID:  chainID,
+				}
+				eventWithTime := &clerk.EventRecordWithTime{
+					EventRecord: record,
+					RecordTime:  recordTime,
+					Time:        recordTime,
+				}
+				events = append(events, eventWithTime)
+			}
+		}
+
+		log.Debug("Successfully fetched state sync events",
+			"fromID", fromID,
+			"to", to,
+			"count", len(events))
+
+		return events, nil
+	}
+
+	// 모든 재시도 실패 후
+	log.Error("All attempts to fetch state sync events failed", "fromID", fromID, "to", to, "error", lastErr)
+	return nil, fmt.Errorf("failed to fetch state sync events after %d attempts: %w", maxRetries, lastErr)
 }
 
 // Span는 지정된 spanID에 해당하는 Tendermint 스팬 정보를 가져옵니다.
@@ -413,37 +578,118 @@ func (c *TendermintABCIClient) Span(ctx context.Context, spanID uint64) (*span.T
 
 // FetchCheckpoint는 지정된 번호의 체크포인트를 조회합니다.
 func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64) (*checkpoint.Checkpoint, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	maxRetries := 3
+	var lastErr error
 
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
+	// ReconnectIfNeeded 호출로 연결 상태 확인 및 재연결 시도
+	if err := c.ReconnectIfNeeded(); err != nil {
+		log.Warn("Failed to reconnect for checkpoint fetch", "error", err)
 	}
 
-	// Tendermint ABCI Query를 사용하여 체크포인트 조회
-	path := fmt.Sprintf("checkpoint/%d", number)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query checkpoint: %w", err)
+	for i := 0; i < maxRetries; i++ {
+		c.rpcMutex.RLock()
+		isConnected := c.isRPCConnected
+		c.rpcMutex.RUnlock()
+
+		if !isConnected {
+			lastErr = ErrRPCNotConnected
+			log.Warn("RPC not connected when fetching checkpoint", "attempt", i+1, "max", maxRetries)
+
+			// 연결 시도
+			if err := c.connectRPC(); err != nil {
+				lastErr = fmt.Errorf("failed to connect to RPC for checkpoint fetch: %w", err)
+				time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+				continue
+			}
+		}
+
+		// 메트릭을 위한 컨텍스트 설정
+		ctx = withRequestType(ctx, checkpointRequest)
+		startTime := time.Now()
+
+		// Tendermint ABCI Query를 사용하여 체크포인트 조회
+		path := fmt.Sprintf("checkpoint/%d", number)
+		queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+
+		// 요청 메트릭 기록
+		isSuccess := err == nil && queryResult.Response.Code == 0
+		sendMetrics(ctx, startTime, isSuccess)
+
+		if err != nil {
+			lastErr = fmt.Errorf("failed to query checkpoint: %w", err)
+			log.Warn("Checkpoint query failed", "attempt", i+1, "max", maxRetries, "error", err)
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		if queryResult.Response.Code != 0 {
+			lastErr = fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+			log.Warn("Checkpoint query returned error code",
+				"attempt", i+1,
+				"max", maxRetries,
+				"code", queryResult.Response.Code,
+				"log", queryResult.Response.Log)
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		// 응답 데이터가 없는 경우
+		if len(queryResult.Response.Value) == 0 {
+			lastErr = fmt.Errorf("no checkpoint found for number %d", number)
+			log.Warn("Empty checkpoint response", "attempt", i+1, "max", maxRetries, "number", number)
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		// 응답 데이터를 Checkpoint 응답으로 언마샬
+		var checkpointResp checkpoint.CheckpointResponse
+		if err := json.Unmarshal(queryResult.Response.Value, &checkpointResp); err != nil {
+			lastErr = fmt.Errorf("failed to unmarshal checkpoint data: %w", err)
+			log.Warn("Failed to unmarshal checkpoint response",
+				"attempt", i+1,
+				"max", maxRetries,
+				"error", err,
+				"data", string(queryResult.Response.Value[:min(len(queryResult.Response.Value), 100)]))
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		// 체크포인트 데이터 검증
+		if checkpointResp.Result.StartBlock == nil || checkpointResp.Result.EndBlock == nil {
+			lastErr = fmt.Errorf("invalid checkpoint data: missing block range")
+			log.Warn("Invalid checkpoint data", "attempt", i+1, "max", maxRetries)
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		if checkpointResp.Result.RootHash == (common.Hash{}) {
+			lastErr = fmt.Errorf("invalid checkpoint data: empty root hash")
+			log.Warn("Invalid checkpoint root hash", "attempt", i+1, "max", maxRetries)
+			time.Sleep(time.Duration(i+1) * time.Second) // 지수 백오프
+			continue
+		}
+
+		log.Debug("Successfully fetched checkpoint",
+			"number", number,
+			"startBlock", checkpointResp.Result.StartBlock,
+			"endBlock", checkpointResp.Result.EndBlock,
+			"rootHash", checkpointResp.Result.RootHash.Hex())
+
+		return &checkpointResp.Result, nil
 	}
 
-	if queryResult.Response.Code != 0 {
-		return nil, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
+	// 모든 재시도 실패 후
+	log.Error("All attempts to fetch checkpoint failed", "number", number, "error", lastErr)
+	return nil, fmt.Errorf("failed to fetch checkpoint after %d attempts: %w", maxRetries, lastErr)
+}
 
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return nil, fmt.Errorf("no checkpoint found for number %d", number)
+// min은 두 정수 중 작은 값을 반환하는 헬퍼 함수입니다.
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-
-	// 응답 데이터를 Checkpoint 응답으로 언마샬
-	var checkpointResp checkpoint.CheckpointResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &checkpointResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal checkpoint data: %w", err)
-	}
-
-	return &checkpointResp.Result, nil
+	return b
 }
 
 // FetchCheckpointCount는 체크포인트의 총 개수를 조회합니다.
@@ -687,75 +933,74 @@ func (c *TendermintABCIClient) Close() {
 	close(c.closeCh)
 }
 
-// BlockInfo는 주어진 블록 높이의 Tendermint 블록 정보를 조회합니다.
-func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*span.TendermintBlock, error) {
+// BlockInfo 메서드는 특정 높이의 블록 정보를 조회합니다.
+func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*eirene.BlockInfo, error) {
 	c.rpcMutex.RLock()
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결되지 않은 경우 자동 재연결 시도
-		if err := c.ReconnectIfNeeded(); err != nil {
-			return nil, ErrRPCNotConnected
-		}
+		return nil, ErrRPCNotConnected
 	}
 
 	// Tendermint RPC를 통해 블록 정보 조회
-	blockResult, err := c.rpcClient.Block(ctx, height)
+	result, err := c.rpcClient.Block(ctx, height)
 	if err != nil {
-		log.Error("Failed to fetch block info from Tendermint", "height", height, "error", err)
-		return nil, fmt.Errorf("failed to fetch block info: %w", err)
+		return nil, fmt.Errorf("failed to get block info: %w", err)
 	}
 
-	if blockResult == nil || blockResult.Block == nil {
-		return nil, fmt.Errorf("no block found for height %v", height)
+	if result.BlockID.Hash == nil || result.Block == nil {
+		return nil, fmt.Errorf("invalid block response: empty block data")
 	}
 
-	// Tendermint 블록 데이터를 TendermintBlock 형식으로 변환
-	block := blockResult.Block
-	tmBlock := &span.TendermintBlock{
-		Header: span.TendermintBlockHeader{
-			ChainID:     block.Header.ChainID,
-			Height:      block.Header.Height,
-			Time:        block.Header.Time,
-			NumTxs:      int64(len(block.Txs)),
-			LastBlockID: block.Header.LastBlockID.String(),
-			AppHash:     block.Header.AppHash,
+	// 블록 정보 변환
+	blockInfo := &eirene.BlockInfo{
+		BlockID: eirene.BlockID{
+			Hash: result.BlockID.Hash,
+		},
+		Header: eirene.BlockHeader{
+			ChainID:         result.Block.ChainID,
+			Height:          result.Block.Height,
+			Time:            result.Block.Time,
+			DataHash:        result.Block.DataHash,
+			AppHash:         result.Block.AppHash,
+			ProposerAddress: result.Block.ProposerAddress,
 		},
 	}
 
-	// 제안자 주소 변환 (Tendermint 주소 형식 → Ethereum 주소 형식)
-	proposerAddrBytes := block.Header.ProposerAddress
-	if len(proposerAddrBytes) >= common.AddressLength {
-		copy(tmBlock.Header.ProposerAddress[:], proposerAddrBytes[:common.AddressLength])
+	// Parts Header 설정
+	blockInfo.BlockID.PartsHeader.Total = result.BlockID.PartSetHeader.Total
+	blockInfo.BlockID.PartsHeader.Hash = result.BlockID.PartSetHeader.Hash
+
+	// Version 설정
+	blockInfo.Header.Version.Block = uint64(result.Block.Version.Block)
+	blockInfo.Header.Version.App = uint64(result.Block.Version.App)
+
+	// 트랜잭션 데이터 설정
+	blockInfo.Data.Txs = make([][]byte, len(result.Block.Txs))
+	for i, tx := range result.Block.Txs {
+		blockInfo.Data.Txs[i] = tx
 	}
 
-	// 트랜잭션 정보 추가 (필요한 경우)
-	if len(block.Txs) > 0 {
-		tmBlock.Transactions = make([]string, len(block.Txs))
-		for i, tx := range block.Txs {
-			tmBlock.Transactions[i] = fmt.Sprintf("%X", tx.Hash())
-		}
+	// 해시 데이터 설정
+	blockInfo.Header.ValidatorsHash = result.Block.ValidatorsHash
+	blockInfo.Header.NextValidatorsHash = result.Block.NextValidatorsHash
+	blockInfo.Header.ConsensusHash = result.Block.ConsensusHash
+	blockInfo.Header.LastResultsHash = result.Block.LastResultsHash
+	blockInfo.Header.EvidenceHash = result.Block.EvidenceHash
+
+	// LastBlockID 설정
+	blockInfo.Header.LastBlockID.Hash = result.Block.LastBlockID.Hash
+	blockInfo.Header.LastBlockID.PartsHeader.Total = result.Block.LastBlockID.PartSetHeader.Total
+	blockInfo.Header.LastBlockID.PartsHeader.Hash = result.Block.LastBlockID.PartSetHeader.Hash
+
+	// LastCommit 설정
+	if result.Block.LastCommit != nil {
+		blockInfo.Header.LastCommit.Height = result.Block.LastCommit.Height
+		blockInfo.Header.LastCommit.Round = result.Block.LastCommit.Round
+		blockInfo.Header.LastCommit.BlockID.Hash = result.Block.LastCommit.BlockID.Hash
+		blockInfo.Header.LastCommit.BlockID.PartsHeader.Total = result.Block.LastCommit.BlockID.PartSetHeader.Total
+		blockInfo.Header.LastCommit.BlockID.PartsHeader.Hash = result.Block.LastCommit.BlockID.PartSetHeader.Hash
 	}
 
-	// 커밋 정보 추가 (있는 경우)
-	if block.LastCommit != nil {
-		tmBlock.Commit = &span.TendermintCommit{
-			Height:    block.LastCommit.Height,
-			Round:     block.LastCommit.Round,
-			BlockID:   block.LastCommit.BlockID.String(),
-			Timestamp: block.Time,
-		}
-
-		// 서명 정보 추가
-		if len(block.LastCommit.Signatures) > 0 {
-			tmBlock.Commit.Signatures = make([]string, len(block.LastCommit.Signatures))
-			for i, sig := range block.LastCommit.Signatures {
-				if sig.Signature != nil {
-					tmBlock.Commit.Signatures[i] = fmt.Sprintf("%X", sig.Signature)
-				}
-			}
-		}
-	}
-
-	return tmBlock, nil
+	return blockInfo, nil
 }
