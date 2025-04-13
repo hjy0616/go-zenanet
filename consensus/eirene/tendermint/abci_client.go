@@ -15,6 +15,7 @@ import (
 	tmrpc "github.com/tendermint/tendermint/rpc/client/http"
 
 	"github.com/zenanetwork/go-zenanet/common"
+	"github.com/zenanetwork/go-zenanet/consensus/eirene"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/clerk"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/tendermint/checkpoint"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/tendermint/milestone"
@@ -162,18 +163,7 @@ func (c *TendermintABCIClient) InitChain(ctx context.Context, req types.RequestI
 	defer c.abciMutex.RUnlock()
 
 	if !c.isABCIConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.abciMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.abciMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.abciMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isABCIConnected {
-			return nil, ErrABCINotConnected
-		}
+		return nil, ErrABCINotConnected
 	}
 
 	resp := c.abciClient.InitChainSync(req)
@@ -190,18 +180,7 @@ func (c *TendermintABCIClient) BeginBlock(ctx context.Context, req types.Request
 	defer c.abciMutex.RUnlock()
 
 	if !c.isABCIConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.abciMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.abciMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.abciMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isABCIConnected {
-			return nil, ErrABCINotConnected
-		}
+		return nil, ErrABCINotConnected
 	}
 
 	resp := c.abciClient.BeginBlockSync(req)
@@ -218,18 +197,7 @@ func (c *TendermintABCIClient) CheckTx(ctx context.Context, req types.RequestChe
 	defer c.abciMutex.RUnlock()
 
 	if !c.isABCIConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.abciMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.abciMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.abciMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isABCIConnected {
-			return nil, ErrABCINotConnected
-		}
+		return nil, ErrABCINotConnected
 	}
 
 	resp := c.abciClient.CheckTxSync(req)
@@ -246,18 +214,7 @@ func (c *TendermintABCIClient) DeliverTx(ctx context.Context, req types.RequestD
 	defer c.abciMutex.RUnlock()
 
 	if !c.isABCIConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.abciMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.abciMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.abciMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isABCIConnected {
-			return nil, ErrABCINotConnected
-		}
+		return nil, ErrABCINotConnected
 	}
 
 	resp := c.abciClient.DeliverTxSync(req)
@@ -274,18 +231,7 @@ func (c *TendermintABCIClient) EndBlock(ctx context.Context, req types.RequestEn
 	defer c.abciMutex.RUnlock()
 
 	if !c.isABCIConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.abciMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.abciMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.abciMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isABCIConnected {
-			return nil, ErrABCINotConnected
-		}
+		return nil, ErrABCINotConnected
 	}
 
 	resp := c.abciClient.EndBlockSync(req)
@@ -302,18 +248,7 @@ func (c *TendermintABCIClient) Commit(ctx context.Context) (*types.ResponseCommi
 	defer c.abciMutex.RUnlock()
 
 	if !c.isABCIConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.abciMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.abciMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.abciMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isABCIConnected {
-			return nil, ErrABCINotConnected
-		}
+		return nil, ErrABCINotConnected
 	}
 
 	resp := c.abciClient.CommitSync()
@@ -330,18 +265,7 @@ func (c *TendermintABCIClient) GetValidators(ctx context.Context) ([]*valset.Val
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return nil, ErrRPCNotConnected
-		}
+		return nil, ErrRPCNotConnected
 	}
 
 	// Tendermint RPC를 통해 검증자 목록 가져오기
@@ -393,18 +317,7 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return nil, ErrRPCNotConnected
-		}
+		return nil, ErrRPCNotConnected
 	}
 
 	// Tendermint RPC를 통해 이벤트 조회
@@ -429,10 +342,6 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 			var stateID uint64
 			var recordTime time.Time
 			var data []byte
-			var contract common.Address
-			var txHash common.Hash
-			var logIndex uint64
-			var chainID string
 
 			for _, attr := range event.Attributes {
 				key := string(attr.Key)
@@ -448,29 +357,18 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 					recordTime = time.Unix(timeInt, 0)
 				case "data":
 					data = value
-				case "contract":
-					contract.UnmarshalText(value)
-				case "tx_hash":
-					txHash.UnmarshalText(value)
-				case "log_index":
-					logIndex, _ = strconv.ParseUint(string(value), 10, 64)
-				case "chain_id":
-					chainID = string(value)
 				}
 			}
 
 			// EventRecordWithTime 생성 및 추가
 			record := &clerk.EventRecord{
-				ID:       id,
-				Contract: contract,
-				Data:     data,
-				TxHash:   txHash,
-				LogIndex: logIndex,
-				ChainID:  chainID,
+				ID:      id,
+				StateID: stateID,
+				Data:    data,
 			}
 			eventWithTime := &clerk.EventRecordWithTime{
-				EventRecord: *record,
-				Time:        recordTime,
+				EventRecord: record,
+				RecordTime:  recordTime,
 			}
 			events = append(events, eventWithTime)
 		}
@@ -485,18 +383,7 @@ func (c *TendermintABCIClient) Span(ctx context.Context, spanID uint64) (*span.T
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return nil, ErrRPCNotConnected
-		}
+		return nil, ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 스팬 정보 조회
@@ -531,18 +418,7 @@ func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return nil, ErrRPCNotConnected
-		}
+		return nil, ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 체크포인트 조회
@@ -577,18 +453,7 @@ func (c *TendermintABCIClient) FetchCheckpointCount(ctx context.Context) (int64,
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return 0, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return 0, ErrRPCNotConnected
-		}
+		return 0, ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 체크포인트 개수 조회
@@ -623,18 +488,7 @@ func (c *TendermintABCIClient) FetchMilestone(ctx context.Context) (*milestone.M
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return nil, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return nil, ErrRPCNotConnected
-		}
+		return nil, ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 최신 마일스톤 조회
@@ -669,18 +523,7 @@ func (c *TendermintABCIClient) FetchMilestoneCount(ctx context.Context) (int64, 
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return 0, fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return 0, ErrRPCNotConnected
-		}
+		return 0, ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 마일스톤 개수 조회
@@ -715,18 +558,7 @@ func (c *TendermintABCIClient) FetchNoAckMilestone(ctx context.Context, mileston
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return ErrRPCNotConnected
-		}
+		return ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 마일스톤 무확인 상태 조회
@@ -766,18 +598,7 @@ func (c *TendermintABCIClient) FetchLastNoAckMilestone(ctx context.Context) (str
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return "", fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return "", ErrRPCNotConnected
-		}
+		return "", ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 마지막 무확인 마일스톤 조회
@@ -812,18 +633,7 @@ func (c *TendermintABCIClient) FetchMilestoneID(ctx context.Context, milestoneID
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		// 연결이 끊어진 경우 재연결 시도
-		c.rpcMutex.RUnlock()
-		if err := c.ReconnectIfNeeded(); err != nil {
-			c.rpcMutex.RLock()
-			return fmt.Errorf("failed to reconnect: %w", err)
-		}
-		c.rpcMutex.RLock()
-
-		// 여전히 연결이 안 된 경우
-		if !c.isRPCConnected {
-			return ErrRPCNotConnected
-		}
+		return ErrRPCNotConnected
 	}
 
 	// Tendermint ABCI Query를 사용하여 마일스톤 ID 조회
@@ -857,64 +667,6 @@ func (c *TendermintABCIClient) FetchMilestoneID(ctx context.Context, milestoneID
 	return nil
 }
 
-// ReconnectIfNeeded는 ABCI 또는 RPC 클라이언트의 연결이 끊어진 경우 자동으로 재연결을 시도합니다.
-// 최대 3번까지 재시도하며, 모든 시도가 실패하면 오류를 반환합니다.
-func (c *TendermintABCIClient) ReconnectIfNeeded() error {
-	var abciErr, rpcErr error
-	maxRetries := 3
-
-	// ABCI 클라이언트 재연결
-	c.abciMutex.RLock()
-	abciConnected := c.isABCIConnected && c.abciClient != nil && c.abciClient.IsRunning()
-	c.abciMutex.RUnlock()
-
-	if !abciConnected {
-		log.Warn("ABCI client is not connected, attempting to reconnect")
-
-		for i := 0; i < maxRetries; i++ {
-			abciErr = c.connectABCI()
-			if abciErr == nil {
-				log.Info("Successfully reconnected to ABCI endpoint")
-				break
-			}
-
-			log.Warn("Failed to reconnect to ABCI endpoint", "attempt", i+1, "error", abciErr)
-			time.Sleep(dialRetryDelay)
-		}
-	}
-
-	// RPC 클라이언트 재연결
-	c.rpcMutex.RLock()
-	rpcConnected := c.isRPCConnected && c.rpcClient != nil
-	c.rpcMutex.RUnlock()
-
-	if !rpcConnected {
-		log.Warn("RPC client is not connected, attempting to reconnect")
-
-		for i := 0; i < maxRetries; i++ {
-			rpcErr = c.connectRPC()
-			if rpcErr == nil {
-				log.Info("Successfully reconnected to RPC endpoint")
-				break
-			}
-
-			log.Warn("Failed to reconnect to RPC endpoint", "attempt", i+1, "error", rpcErr)
-			time.Sleep(dialRetryDelay)
-		}
-	}
-
-	// 오류 반환
-	if abciErr != nil && rpcErr != nil {
-		return fmt.Errorf("failed to reconnect to both ABCI and RPC endpoints: ABCI: %v, RPC: %v", abciErr, rpcErr)
-	} else if abciErr != nil {
-		return fmt.Errorf("failed to reconnect to ABCI endpoint: %v", abciErr)
-	} else if rpcErr != nil {
-		return fmt.Errorf("failed to reconnect to RPC endpoint: %v", rpcErr)
-	}
-
-	return nil
-}
-
 // Close 메서드 - 클라이언트 연결 종료
 func (c *TendermintABCIClient) Close() {
 	c.abciMutex.Lock()
@@ -934,4 +686,76 @@ func (c *TendermintABCIClient) Close() {
 	c.rpcMutex.Unlock()
 
 	close(c.closeCh)
+}
+
+// BlockInfo 메서드는 특정 높이의 블록 정보를 조회합니다.
+func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*eirene.BlockInfo, error) {
+	c.rpcMutex.RLock()
+	defer c.rpcMutex.RUnlock()
+
+	if !c.isRPCConnected {
+		return nil, ErrRPCNotConnected
+	}
+
+	// Tendermint RPC를 통해 블록 정보 조회
+	result, err := c.rpcClient.Block(ctx, height)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block info: %w", err)
+	}
+
+	if result.BlockID.Hash == nil || result.Block == nil {
+		return nil, fmt.Errorf("invalid block response: empty block data")
+	}
+
+	// 블록 정보 변환
+	blockInfo := &eirene.BlockInfo{
+		BlockID: eirene.BlockID{
+			Hash: result.BlockID.Hash,
+		},
+		Header: eirene.BlockHeader{
+			ChainID:         result.Block.ChainID,
+			Height:          result.Block.Height,
+			Time:            result.Block.Time,
+			DataHash:        result.Block.DataHash,
+			AppHash:         result.Block.AppHash,
+			ProposerAddress: result.Block.ProposerAddress,
+		},
+	}
+
+	// Parts Header 설정
+	blockInfo.BlockID.PartsHeader.Total = result.BlockID.PartSetHeader.Total
+	blockInfo.BlockID.PartsHeader.Hash = result.BlockID.PartSetHeader.Hash
+
+	// Version 설정
+	blockInfo.Header.Version.Block = uint64(result.Block.Version.Block)
+	blockInfo.Header.Version.App = uint64(result.Block.Version.App)
+
+	// 트랜잭션 데이터 설정
+	blockInfo.Data.Txs = make([][]byte, len(result.Block.Txs))
+	for i, tx := range result.Block.Txs {
+		blockInfo.Data.Txs[i] = tx
+	}
+
+	// 해시 데이터 설정
+	blockInfo.Header.ValidatorsHash = result.Block.ValidatorsHash
+	blockInfo.Header.NextValidatorsHash = result.Block.NextValidatorsHash
+	blockInfo.Header.ConsensusHash = result.Block.ConsensusHash
+	blockInfo.Header.LastResultsHash = result.Block.LastResultsHash
+	blockInfo.Header.EvidenceHash = result.Block.EvidenceHash
+
+	// LastBlockID 설정
+	blockInfo.Header.LastBlockID.Hash = result.Block.LastBlockID.Hash
+	blockInfo.Header.LastBlockID.PartsHeader.Total = result.Block.LastBlockID.PartSetHeader.Total
+	blockInfo.Header.LastBlockID.PartsHeader.Hash = result.Block.LastBlockID.PartSetHeader.Hash
+
+	// LastCommit 설정
+	if result.Block.LastCommit != nil {
+		blockInfo.Header.LastCommit.Height = result.Block.LastCommit.Height
+		blockInfo.Header.LastCommit.Round = result.Block.LastCommit.Round
+		blockInfo.Header.LastCommit.BlockID.Hash = result.Block.LastCommit.BlockID.Hash
+		blockInfo.Header.LastCommit.BlockID.PartsHeader.Total = result.Block.LastCommit.BlockID.PartSetHeader.Total
+		blockInfo.Header.LastCommit.BlockID.PartsHeader.Hash = result.Block.LastCommit.BlockID.PartSetHeader.Hash
+	}
+
+	return blockInfo, nil
 }

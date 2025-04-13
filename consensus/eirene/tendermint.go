@@ -2,6 +2,7 @@ package eirene
 
 import (
 	"context"
+	"time"
 
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/clerk"
 	"github.com/zenanetwork/go-zenanet/consensus/eirene/tendermint/checkpoint"
@@ -11,6 +12,49 @@ import (
 
 	"github.com/tendermint/tendermint/abci/types"
 )
+
+// BlockID는 Tendermint 블록 ID를 나타냅니다.
+type BlockID struct {
+	Hash        []byte `json:"hash"`
+	PartsHeader struct {
+		Total int    `json:"total"`
+		Hash  []byte `json:"hash"`
+	} `json:"parts"`
+}
+
+// BlockHeader는 Tendermint 블록 헤더를 나타냅니다.
+type BlockHeader struct {
+	Version struct {
+		Block uint64 `json:"block"`
+		App   uint64 `json:"app"`
+	} `json:"version"`
+	ChainID     string    `json:"chain_id"`
+	Height      int64     `json:"height"`
+	Time        time.Time `json:"time"`
+	LastBlockID BlockID   `json:"last_block_id"`
+	LastCommit  struct {
+		Height  int64   `json:"height"`
+		Round   int     `json:"round"`
+		BlockID BlockID `json:"block_id"`
+	} `json:"last_commit_info"`
+	DataHash           []byte `json:"data_hash"`
+	ValidatorsHash     []byte `json:"validators_hash"`
+	NextValidatorsHash []byte `json:"next_validators_hash"`
+	ConsensusHash      []byte `json:"consensus_hash"`
+	AppHash            []byte `json:"app_hash"`
+	LastResultsHash    []byte `json:"last_results_hash"`
+	EvidenceHash       []byte `json:"evidence_hash"`
+	ProposerAddress    []byte `json:"proposer_address"`
+}
+
+// BlockInfo는 Tendermint 블록 정보를 나타냅니다.
+type BlockInfo struct {
+	BlockID BlockID     `json:"block_id"`
+	Header  BlockHeader `json:"header"`
+	Data    struct {
+		Txs [][]byte `json:"txs"`
+	} `json:"data"`
+}
 
 //go:generate mockgen -destination=../../tests/eirene/mocks/ITendermintClient.go -package=mocks . ITendermintClient
 type ITendermintClient interface {
@@ -33,6 +77,9 @@ type ITendermintClient interface {
 
 	GetValidators(ctx context.Context) ([]*valset.Validator, error)
 	GetCurrentValidatorSet(ctx context.Context) (*valset.ValidatorSet, error)
+
+	// 블록 정보 조회 메서드 추가
+	BlockInfo(ctx context.Context, height *int64) (*BlockInfo, error)
 
 	Connect() error
 	IsConnected() bool
