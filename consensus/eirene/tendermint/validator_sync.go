@@ -188,7 +188,7 @@ func (vs *ValidatorSyncer) validatorSetChanged(newSet *valset.ValidatorSet) bool
 		for _, currentVal := range vs.currentSet.Validators {
 			if newVal.Address == currentVal.Address {
 				found = true
-				if newVal.VotingPower != currentVal.VotingPower {
+				if newVal.VotingPower != currentVal.VotingPower || newVal.ProposerPriority != currentVal.ProposerPriority {
 					return true
 				}
 				break
@@ -207,11 +207,11 @@ func (vs *ValidatorSyncer) GetCurrentValidators() []*valset.Validator {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
-	if vs.currentSet == nil || len(vs.currentSet.Validators) == 0 {
-		return []*valset.Validator{}
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
+		return nil
 	}
 
-	// 복사본 반환
+	// 원본 보호를 위해 복사본 반환
 	validators := make([]*valset.Validator, len(vs.currentSet.Validators))
 	for i, val := range vs.currentSet.Validators {
 		validators[i] = val.Copy()
@@ -226,7 +226,7 @@ func (vs *ValidatorSyncer) GetCurrentValidatorSet() *valset.ValidatorSet {
 	defer vs.mu.RUnlock()
 
 	if vs.currentSet == nil {
-		return valset.NewValidatorSet([]*valset.Validator{})
+		return nil
 	}
 
 	return vs.currentSet.Copy()
@@ -237,16 +237,17 @@ func (vs *ValidatorSyncer) GetValidator(address common.Address) (*valset.Validat
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
-	if vs.currentSet == nil {
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
 		return nil, ErrEmptyValidatorSet
 	}
 
-	_, val := vs.currentSet.GetByAddress(address)
-	if val == nil {
-		return nil, ErrValidatorNotFound
+	for _, val := range vs.currentSet.Validators {
+		if val.Address == address {
+			return val.Copy(), nil
+		}
 	}
 
-	return val.Copy(), nil
+	return nil, ErrValidatorNotFound
 }
 
 // GetCurrentSpanID returns the current span ID
@@ -256,34 +257,97 @@ func (vs *ValidatorSyncer) GetCurrentSpanID() uint64 {
 	return vs.currentSpanID
 }
 
-// HandleValidatorUpdate processes validator updates from Tendermint
+// HandleValidatorUpdate processes validator updates and applies them to the local validator set
 func (vs *ValidatorSyncer) HandleValidatorUpdate(ctx context.Context, validators []*valset.Validator) error {
 	if len(validators) == 0 {
-		return nil
+		return errors.New("empty validator update received")
 	}
 
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	// 현재 검증자 세트가 없으면 새로 생성
-	if vs.currentSet == nil {
+	// 현재 세트가 없으면 새로 생성
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
 		vs.currentSet = valset.NewValidatorSet(validators)
 		vs.lastUpdateTime = time.Now()
-		log.Info("Created new validator set", "validators", len(validators))
+		log.Info("Initial validator set created from update",
+			"validators", len(validators),
+			"totalPower", vs.currentSet.TotalVotingPower())
 		return nil
 	}
 
-	// 변경 사항 적용
-	if err := vs.currentSet.UpdateWithChangeSet(validators); err != nil {
-		return fmt.Errorf("failed to update validator set: %w", err)
+	// 검증자 ID 유지를 위한 맵 구성
+	idMap := make(map[common.Address]uint64)
+	for _, val := range vs.currentSet.Validators {
+		if val.ID != 0 {
+			idMap[val.Address] = val.ID
+		}
 	}
 
-	vs.lastUpdateTime = time.Now()
-	log.Info("Updated validator set",
-		"validators", len(vs.currentSet.Validators),
-		"totalPower", vs.currentSet.TotalVotingPower())
+	// 새 검증자에게 ID 할당 (기존 ID 유지)
+	for _, val := range validators {
+		if id, exists := idMap[val.Address]; exists && val.ID == 0 {
+			val.ID = id
+		}
+	}
+
+	// 검증자 세트 업데이트
+	oldSet := vs.currentSet.Copy()
+	newSet := getUpdatedValidatorSet(oldSet, validators)
+
+	// 변경 사항 로깅
+	if vs.validatorSetChanged(newSet) {
+		addedCount, removedCount, changedCount := countValidatorChanges(oldSet, newSet)
+
+		log.Info("Validator set updated",
+			"added", addedCount,
+			"removed", removedCount,
+			"changed", changedCount,
+			"totalCount", newSet.Size(),
+			"totalPower", newSet.TotalVotingPower())
+
+		vs.currentSet = newSet
+		vs.lastUpdateTime = time.Now()
+	}
 
 	return nil
+}
+
+// countValidatorChanges 함수는 이전 검증자 세트와 새 검증자 세트 간의 변경 사항을 계산합니다.
+func countValidatorChanges(oldSet, newSet *valset.ValidatorSet) (added, removed, changed int) {
+	if oldSet == nil || oldSet.IsNilOrEmpty() {
+		return len(newSet.Validators), 0, 0
+	}
+
+	// 주소 기반 맵 생성
+	oldMap := make(map[common.Address]*valset.Validator)
+	for _, val := range oldSet.Validators {
+		oldMap[val.Address] = val
+	}
+
+	newMap := make(map[common.Address]*valset.Validator)
+	for _, val := range newSet.Validators {
+		newMap[val.Address] = val
+	}
+
+	// 추가/변경된 검증자 계산
+	for addr, newVal := range newMap {
+		oldVal, exists := oldMap[addr]
+		if !exists {
+			added++
+		} else if newVal.VotingPower != oldVal.VotingPower {
+			changed++
+		}
+	}
+
+	// 제거된 검증자 계산
+	for addr := range oldMap {
+		if _, exists := newMap[addr]; !exists {
+			removed++
+		}
+	}
+
+	return added, removed, changed
 }
 
 // UpdateSpanID updates the current span ID
@@ -291,20 +355,122 @@ func (vs *ValidatorSyncer) UpdateSpanID(spanID uint64) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	// GetProposer()를 사용하여 현재 제안자 가져오기
-	vs.currentSet.Proposer = vs.currentSet.GetProposer()
-	vs.currentSpanID = spanID
-	log.Info("Updated span ID", "spanID", spanID)
+	if spanID > vs.currentSpanID {
+		log.Info("Updating span ID", "old", vs.currentSpanID, "new", spanID)
+		vs.currentSpanID = spanID
+	}
 }
 
-// ForceSync forces an immediate synchronization with Tendermint
+// ForceSync triggers an immediate validator synchronization
 func (vs *ValidatorSyncer) ForceSync() error {
 	return vs.syncValidators()
 }
 
-// LastUpdateTime returns the time of the last validator set update
+// LastUpdateTime returns the timestamp of the last validator set update
 func (vs *ValidatorSyncer) LastUpdateTime() time.Time {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 	return vs.lastUpdateTime
+}
+
+// UpdateValidatorPriorities 메서드는 검증자 우선순위를 업데이트합니다.
+// 이는 블록 생성 순서에 영향을 줍니다.
+func (vs *ValidatorSyncer) UpdateValidatorPriorities(times int) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
+		return ErrEmptyValidatorSet
+	}
+
+	// 우선순위 업데이트 (Tendermint 알고리즘과 일치)
+	vs.currentSet.IncrementProposerPriority(times)
+	log.Debug("Updated validator priorities",
+		"times", times,
+		"newProposer", vs.currentSet.GetProposer().Address.Hex())
+
+	return nil
+}
+
+// GetProposer 메서드는 현재 블록 제안자를 반환합니다.
+func (vs *ValidatorSyncer) GetProposer() *valset.Validator {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
+		return nil
+	}
+
+	return vs.currentSet.GetProposer().Copy()
+}
+
+// IsValidator 메서드는 주어진 주소가 현재 검증자 세트에 포함되어 있는지 확인합니다.
+func (vs *ValidatorSyncer) IsValidator(address common.Address) bool {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
+		return false
+	}
+
+	return vs.currentSet.HasAddress(address)
+}
+
+// IsProposer 메서드는 주어진 주소가 현재 블록 제안자인지 확인합니다.
+func (vs *ValidatorSyncer) IsProposer(address common.Address) bool {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	if vs.currentSet == nil || vs.currentSet.IsNilOrEmpty() {
+		return false
+	}
+
+	proposer := vs.currentSet.GetProposer()
+	return proposer != nil && proposer.Address == address
+}
+
+// getUpdatedValidatorSet 함수는 이전 검증자 세트와 새 검증자 목록을 기반으로 업데이트된 검증자 세트를 반환합니다.
+func getUpdatedValidatorSet(oldValidatorSet *valset.ValidatorSet, newVals []*valset.Validator) *valset.ValidatorSet {
+	v := oldValidatorSet
+	oldVals := v.Validators
+
+	changes := make([]*valset.Validator, 0, len(oldVals))
+
+	for _, ov := range oldVals {
+		if f, ok := validatorContains(newVals, ov); ok {
+			ov.VotingPower = f.VotingPower
+		} else {
+			ov.VotingPower = 0
+		}
+
+		changes = append(changes, ov)
+	}
+
+	for _, nv := range newVals {
+		if _, ok := validatorContains(changes, nv); !ok {
+			changes = append(changes, nv)
+		}
+	}
+
+	if err := v.UpdateWithChangeSet(changes); err != nil {
+		changesStr := ""
+		for _, change := range changes {
+			changesStr += fmt.Sprintf("Address: %s, VotingPower: %d\n", change.Address, change.VotingPower)
+		}
+		log.Warn("Changes in validator set", "changes", changesStr)
+		log.Error("Error while updating change set", "error", err)
+	}
+
+	return v
+}
+
+// validatorContains 함수는 주어진 validator가 목록에 포함되어 있는지 확인합니다.
+func validatorContains(a []*valset.Validator, x *valset.Validator) (*valset.Validator, bool) {
+	for _, n := range a {
+		if n.Address == x.Address {
+			return n, true
+		}
+	}
+
+	return nil, false
 }

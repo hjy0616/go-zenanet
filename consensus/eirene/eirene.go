@@ -1250,6 +1250,36 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
 	}
 
+	// Tendermint 검증자 역할 확인
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		// 현재 검증자 세트 확인
+		validatorSet, err := c.TendermintClient.GetCurrentValidatorSet(ctx)
+		if err == nil && validatorSet != nil {
+			// 현재 노드가 검증자인지 확인
+			if !validatorSet.HasAddress(signer) {
+				log.Warn("Node is not a current Tendermint validator", "signer", signer.Hex())
+				return &UnauthorizedSignerError{number - 1, signer.Bytes()}
+			}
+
+			// 현재 노드가 제안자인지 확인하고 로깅
+			proposer := validatorSet.GetProposer()
+			if proposer != nil {
+				if proposer.Address == signer {
+					log.Info("Node is the current Tendermint proposer", "signer", signer.Hex())
+				} else {
+					log.Info("Node is a validator but not the proposer",
+						"signer", signer.Hex(),
+						"proposer", proposer.Address.Hex())
+				}
+			}
+		} else {
+			log.Warn("Failed to get current validator set from Tendermint", "err", err)
+		}
+	}
+
 	// If we're amongst the recent signers, wait for the next block
 	// 순서 번호를 얻기 위해 GetSignerSuccessionNumber 메서드 사용
 	succession, err := snap.GetSignerSuccessionNumber(signer)
