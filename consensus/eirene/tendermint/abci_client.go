@@ -158,382 +158,221 @@ func (c *TendermintABCIClient) IsConnected() bool {
 
 // InitChain implements the ITendermintClient interface
 func (c *TendermintABCIClient) InitChain(ctx context.Context, req types.RequestInitChain) (*types.ResponseInitChain, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.abciMutex.RLock()
+	defer c.abciMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying InitChain after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for InitChain", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrABCINotConnected
-				log.Error("Failed to establish connection for InitChain", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.abciMutex.RLock()
-		if !c.isABCIConnected {
-			c.abciMutex.RUnlock()
-			lastErr = ErrABCINotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		resp := c.abciClient.InitChainSync(req)
+	if !c.isABCIConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.abciMutex.RUnlock()
-
-		if resp.Error != nil {
-			lastErr = resp.Error
-			log.Error("Error in InitChain response", "error", resp.Error, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.abciMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.abciMutex.RLock()
 
-		return &resp.Response, nil
+		// 여전히 연결이 안 된 경우
+		if !c.isABCIConnected {
+			return nil, ErrABCINotConnected
+		}
 	}
 
-	return nil, fmt.Errorf("failed to execute InitChain after %d attempts: %w", maxRetries, lastErr)
+	resp := c.abciClient.InitChainSync(req)
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	return &resp.Response, nil
 }
 
 // BeginBlock implements the ITendermintClient interface
 func (c *TendermintABCIClient) BeginBlock(ctx context.Context, req types.RequestBeginBlock) (*types.ResponseBeginBlock, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.abciMutex.RLock()
+	defer c.abciMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying BeginBlock after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for BeginBlock", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrABCINotConnected
-				log.Error("Failed to establish connection for BeginBlock", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.abciMutex.RLock()
-		if !c.isABCIConnected {
-			c.abciMutex.RUnlock()
-			lastErr = ErrABCINotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		resp := c.abciClient.BeginBlockSync(req)
+	if !c.isABCIConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.abciMutex.RUnlock()
-
-		if resp.Error != nil {
-			lastErr = resp.Error
-			log.Error("Error in BeginBlock response", "error", resp.Error, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.abciMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.abciMutex.RLock()
 
-		return &resp.Response, nil
+		// 여전히 연결이 안 된 경우
+		if !c.isABCIConnected {
+			return nil, ErrABCINotConnected
+		}
 	}
 
-	return nil, fmt.Errorf("failed to execute BeginBlock after %d attempts: %w", maxRetries, lastErr)
+	resp := c.abciClient.BeginBlockSync(req)
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	return &resp.Response, nil
 }
 
 // CheckTx implements the ITendermintClient interface
 func (c *TendermintABCIClient) CheckTx(ctx context.Context, req types.RequestCheckTx) (*types.ResponseCheckTx, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.abciMutex.RLock()
+	defer c.abciMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying CheckTx after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for CheckTx", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrABCINotConnected
-				log.Error("Failed to establish connection for CheckTx", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.abciMutex.RLock()
-		if !c.isABCIConnected {
-			c.abciMutex.RUnlock()
-			lastErr = ErrABCINotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		resp := c.abciClient.CheckTxSync(req)
+	if !c.isABCIConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.abciMutex.RUnlock()
-
-		if resp.Error != nil {
-			lastErr = resp.Error
-			log.Error("Error in CheckTx response", "error", resp.Error, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.abciMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.abciMutex.RLock()
 
-		return &resp.Response, nil
+		// 여전히 연결이 안 된 경우
+		if !c.isABCIConnected {
+			return nil, ErrABCINotConnected
+		}
 	}
 
-	return nil, fmt.Errorf("failed to execute CheckTx after %d attempts: %w", maxRetries, lastErr)
+	resp := c.abciClient.CheckTxSync(req)
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	return &resp.Response, nil
 }
 
 // DeliverTx implements the ITendermintClient interface
 func (c *TendermintABCIClient) DeliverTx(ctx context.Context, req types.RequestDeliverTx) (*types.ResponseDeliverTx, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.abciMutex.RLock()
+	defer c.abciMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying DeliverTx after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for DeliverTx", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrABCINotConnected
-				log.Error("Failed to establish connection for DeliverTx", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.abciMutex.RLock()
-		if !c.isABCIConnected {
-			c.abciMutex.RUnlock()
-			lastErr = ErrABCINotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		resp := c.abciClient.DeliverTxSync(req)
+	if !c.isABCIConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.abciMutex.RUnlock()
-
-		if resp.Error != nil {
-			lastErr = resp.Error
-			log.Error("Error in DeliverTx response", "error", resp.Error, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.abciMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.abciMutex.RLock()
 
-		return &resp.Response, nil
+		// 여전히 연결이 안 된 경우
+		if !c.isABCIConnected {
+			return nil, ErrABCINotConnected
+		}
 	}
 
-	return nil, fmt.Errorf("failed to execute DeliverTx after %d attempts: %w", maxRetries, lastErr)
+	resp := c.abciClient.DeliverTxSync(req)
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	return &resp.Response, nil
 }
 
 // EndBlock implements the ITendermintClient interface
 func (c *TendermintABCIClient) EndBlock(ctx context.Context, req types.RequestEndBlock) (*types.ResponseEndBlock, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.abciMutex.RLock()
+	defer c.abciMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying EndBlock after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for EndBlock", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrABCINotConnected
-				log.Error("Failed to establish connection for EndBlock", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.abciMutex.RLock()
-		if !c.isABCIConnected {
-			c.abciMutex.RUnlock()
-			lastErr = ErrABCINotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		resp := c.abciClient.EndBlockSync(req)
+	if !c.isABCIConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.abciMutex.RUnlock()
-
-		if resp.Error != nil {
-			lastErr = resp.Error
-			log.Error("Error in EndBlock response", "error", resp.Error, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.abciMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.abciMutex.RLock()
 
-		return &resp.Response, nil
+		// 여전히 연결이 안 된 경우
+		if !c.isABCIConnected {
+			return nil, ErrABCINotConnected
+		}
 	}
 
-	return nil, fmt.Errorf("failed to execute EndBlock after %d attempts: %w", maxRetries, lastErr)
+	resp := c.abciClient.EndBlockSync(req)
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	return &resp.Response, nil
 }
 
 // Commit implements the ITendermintClient interface
 func (c *TendermintABCIClient) Commit(ctx context.Context) (*types.ResponseCommit, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.abciMutex.RLock()
+	defer c.abciMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying Commit after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for Commit", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrABCINotConnected
-				log.Error("Failed to establish connection for Commit", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.abciMutex.RLock()
-		if !c.isABCIConnected {
-			c.abciMutex.RUnlock()
-			lastErr = ErrABCINotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		resp := c.abciClient.CommitSync()
+	if !c.isABCIConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.abciMutex.RUnlock()
-
-		if resp.Error != nil {
-			lastErr = resp.Error
-			log.Error("Error in Commit response", "error", resp.Error, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.abciMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.abciMutex.RLock()
 
-		return &resp.Response, nil
+		// 여전히 연결이 안 된 경우
+		if !c.isABCIConnected {
+			return nil, ErrABCINotConnected
+		}
 	}
 
-	return nil, fmt.Errorf("failed to execute Commit after %d attempts: %w", maxRetries, lastErr)
+	resp := c.abciClient.CommitSync()
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	return &resp.Response, nil
 }
 
 // GetValidators implements the ITendermintClient interface
 func (c *TendermintABCIClient) GetValidators(ctx context.Context) ([]*valset.Validator, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.rpcMutex.RLock()
+	defer c.rpcMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying GetValidators after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for GetValidators", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrRPCNotConnected
-				log.Error("Failed to establish connection for GetValidators", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.rpcMutex.RLock()
-		if !c.isRPCConnected {
-			c.rpcMutex.RUnlock()
-			lastErr = ErrRPCNotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		// Tendermint RPC를 통해 검증자 목록 가져오기
-		validatorsResp, err := c.rpcClient.Validators(ctx, nil, nil, nil)
+	if !c.isRPCConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.rpcMutex.RUnlock()
-
-		if err != nil {
-			lastErr = err
-			log.Error("Failed to fetch validators", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.rpcMutex.RLock()
 
-		validators := make([]*valset.Validator, 0, len(validatorsResp.Validators))
-		for _, v := range validatorsResp.Validators {
-			// Tendermint 주소를 Ethereum 주소로 변환
-			// Tendermint 주소는 일반적으로 20바이트이므로 common.Address로 변환 가능
-			var ethAddr common.Address
-			addrBytes := v.Address
-			if len(addrBytes) > common.AddressLength {
-				addrBytes = addrBytes[:common.AddressLength]
-			}
-			copy(ethAddr[:], addrBytes)
-
-			// Tendermint 검증자를 Eirene 검증자로 변환
-			validator := valset.NewValidator(ethAddr, v.VotingPower)
-			validator.ProposerPriority = v.ProposerPriority
-
-			// ID는 주소의 해시 또는 적절한 방법으로 설정
-			// 여기서는 주소의 첫 8바이트를 uint64로 변환하여 ID로 사용
-			validator.ID = binary.BigEndian.Uint64(append(ethAddr.Bytes()[:8], make([]byte, 8-len(ethAddr.Bytes()[:8]))...))
-
-			validators = append(validators, validator)
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return nil, ErrRPCNotConnected
 		}
-
-		return validators, nil
 	}
 
-	return nil, fmt.Errorf("failed to execute GetValidators after %d attempts: %w", maxRetries, lastErr)
+	// Tendermint RPC를 통해 검증자 목록 가져오기
+	validatorsResp, err := c.rpcClient.Validators(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch validators: %w", err)
+	}
+
+	validators := make([]*valset.Validator, 0, len(validatorsResp.Validators))
+	for _, v := range validatorsResp.Validators {
+		// Tendermint 주소를 Ethereum 주소로 변환
+		// Tendermint 주소는 일반적으로 20바이트이므로 common.Address로 변환 가능
+		var ethAddr common.Address
+		addrBytes := v.Address
+		if len(addrBytes) > common.AddressLength {
+			addrBytes = addrBytes[:common.AddressLength]
+		}
+		copy(ethAddr[:], addrBytes)
+
+		// Tendermint 검증자를 Eirene 검증자로 변환
+		validator := valset.NewValidator(ethAddr, v.VotingPower)
+		validator.ProposerPriority = v.ProposerPriority
+
+		// ID는 주소의 해시 또는 적절한 방법으로 설정
+		// 여기서는 주소의 첫 8바이트를 uint64로 변환하여 ID로 사용
+		validator.ID = binary.BigEndian.Uint64(append(ethAddr.Bytes()[:8], make([]byte, 8-len(ethAddr.Bytes()[:8]))...))
+
+		validators = append(validators, validator)
+	}
+
+	return validators, nil
 }
 
 // GetCurrentValidatorSet implements the ITendermintClient interface
@@ -554,7 +393,18 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
+		// 연결이 끊어진 경우 재연결 시도
+		c.rpcMutex.RUnlock()
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
+		}
+		c.rpcMutex.RLock()
+
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return nil, ErrRPCNotConnected
+		}
 	}
 
 	// Tendermint RPC를 통해 이벤트 조회
@@ -579,6 +429,10 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 			var stateID uint64
 			var recordTime time.Time
 			var data []byte
+			var contract common.Address
+			var txHash common.Hash
+			var logIndex uint64
+			var chainID string
 
 			for _, attr := range event.Attributes {
 				key := string(attr.Key)
@@ -594,18 +448,29 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 					recordTime = time.Unix(timeInt, 0)
 				case "data":
 					data = value
+				case "contract":
+					contract.UnmarshalText(value)
+				case "tx_hash":
+					txHash.UnmarshalText(value)
+				case "log_index":
+					logIndex, _ = strconv.ParseUint(string(value), 10, 64)
+				case "chain_id":
+					chainID = string(value)
 				}
 			}
 
 			// EventRecordWithTime 생성 및 추가
 			record := &clerk.EventRecord{
-				ID:      id,
-				StateID: stateID,
-				Data:    data,
+				ID:       id,
+				Contract: contract,
+				Data:     data,
+				TxHash:   txHash,
+				LogIndex: logIndex,
+				ChainID:  chainID,
 			}
 			eventWithTime := &clerk.EventRecordWithTime{
-				EventRecord: record,
-				RecordTime:  recordTime,
+				EventRecord: *record,
+				Time:        recordTime,
 			}
 			events = append(events, eventWithTime)
 		}
@@ -620,7 +485,18 @@ func (c *TendermintABCIClient) Span(ctx context.Context, spanID uint64) (*span.T
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
+		// 연결이 끊어진 경우 재연결 시도
+		c.rpcMutex.RUnlock()
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
+		}
+		c.rpcMutex.RLock()
+
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return nil, ErrRPCNotConnected
+		}
 	}
 
 	// Tendermint ABCI Query를 사용하여 스팬 정보 조회
@@ -655,7 +531,18 @@ func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
+		// 연결이 끊어진 경우 재연결 시도
+		c.rpcMutex.RUnlock()
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
+		}
+		c.rpcMutex.RLock()
+
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return nil, ErrRPCNotConnected
+		}
 	}
 
 	// Tendermint ABCI Query를 사용하여 체크포인트 조회
@@ -686,236 +573,140 @@ func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64
 
 // FetchCheckpointCount는 체크포인트의 총 개수를 조회합니다.
 func (c *TendermintABCIClient) FetchCheckpointCount(ctx context.Context) (int64, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.rpcMutex.RLock()
+	defer c.rpcMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying FetchCheckpointCount after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for FetchCheckpointCount", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrRPCNotConnected
-				log.Error("Failed to establish connection for FetchCheckpointCount", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.rpcMutex.RLock()
-		if !c.isRPCConnected {
-			c.rpcMutex.RUnlock()
-			lastErr = ErrRPCNotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return 0, lastErr
-		}
-
-		// Tendermint ABCI Query를 사용하여 체크포인트 개수 조회
-		path := "checkpoint/count"
-		queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+	if !c.isRPCConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.rpcMutex.RUnlock()
-
-		if err != nil {
-			lastErr = err
-			log.Error("Failed to query checkpoint count", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return 0, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.rpcMutex.RLock()
 
-		if queryResult.Response.Code != 0 {
-			lastErr = fmt.Errorf("query failed with code %d: %s",
-				queryResult.Response.Code, queryResult.Response.Log)
-			log.Error("Query failed", "code", queryResult.Response.Code, "log", queryResult.Response.Log, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return 0, ErrRPCNotConnected
 		}
-
-		// 응답 데이터가 없는 경우
-		if len(queryResult.Response.Value) == 0 {
-			lastErr = fmt.Errorf("checkpoint count not found")
-			log.Error("Checkpoint count not found", "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
-		}
-
-		// 응답 데이터를 CheckpointCount 응답으로 언마샬
-		var countResp checkpoint.CheckpointCountResponse
-		if err := json.Unmarshal(queryResult.Response.Value, &countResp); err != nil {
-			lastErr = fmt.Errorf("failed to unmarshal checkpoint count data: %w", err)
-			log.Error("Failed to unmarshal checkpoint count data", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
-		}
-
-		return countResp.Result.Result, nil
 	}
 
-	return 0, fmt.Errorf("failed to execute FetchCheckpointCount after %d attempts: %w", maxRetries, lastErr)
+	// Tendermint ABCI Query를 사용하여 체크포인트 개수 조회
+	path := "checkpoint/count"
+	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query checkpoint count: %w", err)
+	}
+
+	if queryResult.Response.Code != 0 {
+		return 0, fmt.Errorf("query failed with code %d: %s",
+			queryResult.Response.Code, queryResult.Response.Log)
+	}
+
+	// 응답 데이터가 없는 경우
+	if len(queryResult.Response.Value) == 0 {
+		return 0, fmt.Errorf("checkpoint count not found")
+	}
+
+	// 응답 데이터를 CheckpointCount 응답으로 언마샬
+	var countResp checkpoint.CheckpointCountResponse
+	if err := json.Unmarshal(queryResult.Response.Value, &countResp); err != nil {
+		return 0, fmt.Errorf("failed to unmarshal checkpoint count data: %w", err)
+	}
+
+	return countResp.Result.Result, nil
 }
 
 // FetchMilestone는 최신 마일스톤을 조회합니다.
 func (c *TendermintABCIClient) FetchMilestone(ctx context.Context) (*milestone.Milestone, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.rpcMutex.RLock()
+	defer c.rpcMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying FetchMilestone after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for FetchMilestone", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrRPCNotConnected
-				log.Error("Failed to establish connection for FetchMilestone", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.rpcMutex.RLock()
-		if !c.isRPCConnected {
-			c.rpcMutex.RUnlock()
-			lastErr = ErrRPCNotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return nil, lastErr
-		}
-
-		// Tendermint ABCI Query를 사용하여 최신 마일스톤 조회
-		path := "milestone/latest"
-		queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+	if !c.isRPCConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.rpcMutex.RUnlock()
-
-		if err != nil {
-			lastErr = err
-			log.Error("Failed to query latest milestone", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return nil, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.rpcMutex.RLock()
 
-		if queryResult.Response.Code != 0 {
-			lastErr = fmt.Errorf("query failed with code %d: %s",
-				queryResult.Response.Code, queryResult.Response.Log)
-			log.Error("Query failed", "code", queryResult.Response.Code, "log", queryResult.Response.Log, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return nil, ErrRPCNotConnected
 		}
-
-		// 응답 데이터가 없는 경우
-		if len(queryResult.Response.Value) == 0 {
-			lastErr = fmt.Errorf("latest milestone not found")
-			log.Error("Latest milestone not found", "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
-		}
-
-		// 응답 데이터를 Milestone 응답으로 언마샬
-		var milestoneResp milestone.MilestoneResponse
-		if err := json.Unmarshal(queryResult.Response.Value, &milestoneResp); err != nil {
-			lastErr = fmt.Errorf("failed to unmarshal milestone data: %w", err)
-			log.Error("Failed to unmarshal milestone data", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
-		}
-
-		return &milestoneResp.Result, nil
 	}
 
-	return nil, fmt.Errorf("failed to execute FetchMilestone after %d attempts: %w", maxRetries, lastErr)
+	// Tendermint ABCI Query를 사용하여 최신 마일스톤 조회
+	path := "milestone/latest"
+	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest milestone: %w", err)
+	}
+
+	if queryResult.Response.Code != 0 {
+		return nil, fmt.Errorf("query failed with code %d: %s",
+			queryResult.Response.Code, queryResult.Response.Log)
+	}
+
+	// 응답 데이터가 없는 경우
+	if len(queryResult.Response.Value) == 0 {
+		return nil, fmt.Errorf("latest milestone not found")
+	}
+
+	// 응답 데이터를 Milestone 응답으로 언마샬
+	var milestoneResp milestone.MilestoneResponse
+	if err := json.Unmarshal(queryResult.Response.Value, &milestoneResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal milestone data: %w", err)
+	}
+
+	return &milestoneResp.Result, nil
 }
 
 // FetchMilestoneCount는 마일스톤의 총 개수를 조회합니다.
 func (c *TendermintABCIClient) FetchMilestoneCount(ctx context.Context) (int64, error) {
-	const maxRetries = 3
-	var lastErr error
+	c.rpcMutex.RLock()
+	defer c.rpcMutex.RUnlock()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		// 재연결 필요한 경우 시도
-		if retry > 0 {
-			log.Warn("Retrying FetchMilestoneCount after connection failure", "attempt", retry+1, "maxRetries", maxRetries)
-			connected, err := c.ReconnectIfNeeded()
-			if err != nil {
-				lastErr = err
-				log.Error("Failed to reconnect for FetchMilestoneCount", "error", err, "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-			if !connected {
-				lastErr = ErrRPCNotConnected
-				log.Error("Failed to establish connection for FetchMilestoneCount", "attempt", retry+1)
-				time.Sleep(dialRetryDelay)
-				continue
-			}
-		}
-
-		c.rpcMutex.RLock()
-		if !c.isRPCConnected {
-			c.rpcMutex.RUnlock()
-			lastErr = ErrRPCNotConnected
-			if retry == 0 {
-				// 첫 시도에서 연결되지 않은 경우, 재연결 시도
-				continue
-			}
-			return 0, lastErr
-		}
-
-		// Tendermint ABCI Query를 사용하여 마일스톤 개수 조회
-		path := "milestone/count"
-		queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+	if !c.isRPCConnected {
+		// 연결이 끊어진 경우 재연결 시도
 		c.rpcMutex.RUnlock()
-
-		if err != nil {
-			lastErr = err
-			log.Error("Failed to query milestone count", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return 0, fmt.Errorf("failed to reconnect: %w", err)
 		}
+		c.rpcMutex.RLock()
 
-		if queryResult.Response.Code != 0 {
-			lastErr = fmt.Errorf("query failed with code %d: %s",
-				queryResult.Response.Code, queryResult.Response.Log)
-			log.Error("Query failed", "code", queryResult.Response.Code, "log", queryResult.Response.Log, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return 0, ErrRPCNotConnected
 		}
-
-		// 응답 데이터가 없는 경우
-		if len(queryResult.Response.Value) == 0 {
-			lastErr = fmt.Errorf("milestone count not found")
-			log.Error("Milestone count not found", "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
-		}
-
-		// 응답 데이터를 MilestoneCount 응답으로 언마샬
-		var countResp milestone.MilestoneCountResponse
-		if err := json.Unmarshal(queryResult.Response.Value, &countResp); err != nil {
-			lastErr = fmt.Errorf("failed to unmarshal milestone count data: %w", err)
-			log.Error("Failed to unmarshal milestone count data", "error", err, "attempt", retry+1)
-			time.Sleep(dialRetryDelay)
-			continue
-		}
-
-		return countResp.Result.Count, nil
 	}
 
-	return 0, fmt.Errorf("failed to execute FetchMilestoneCount after %d attempts: %w", maxRetries, lastErr)
+	// Tendermint ABCI Query를 사용하여 마일스톤 개수 조회
+	path := "milestone/count"
+	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query milestone count: %w", err)
+	}
+
+	if queryResult.Response.Code != 0 {
+		return 0, fmt.Errorf("query failed with code %d: %s",
+			queryResult.Response.Code, queryResult.Response.Log)
+	}
+
+	// 응답 데이터가 없는 경우
+	if len(queryResult.Response.Value) == 0 {
+		return 0, fmt.Errorf("milestone count not found")
+	}
+
+	// 응답 데이터를 MilestoneCount 응답으로 언마샬
+	var countResp milestone.MilestoneCountResponse
+	if err := json.Unmarshal(queryResult.Response.Value, &countResp); err != nil {
+		return 0, fmt.Errorf("failed to unmarshal milestone count data: %w", err)
+	}
+
+	return countResp.Result.Count, nil
 }
 
 // FetchNoAckMilestone는 특정 ID의 마일스톤이 Tendermint에서 실패했는지 여부를 조회합니다.
@@ -924,7 +715,18 @@ func (c *TendermintABCIClient) FetchNoAckMilestone(ctx context.Context, mileston
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		return ErrRPCNotConnected
+		// 연결이 끊어진 경우 재연결 시도
+		c.rpcMutex.RUnlock()
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return fmt.Errorf("failed to reconnect: %w", err)
+		}
+		c.rpcMutex.RLock()
+
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return ErrRPCNotConnected
+		}
 	}
 
 	// Tendermint ABCI Query를 사용하여 마일스톤 무확인 상태 조회
@@ -964,7 +766,18 @@ func (c *TendermintABCIClient) FetchLastNoAckMilestone(ctx context.Context) (str
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		return "", ErrRPCNotConnected
+		// 연결이 끊어진 경우 재연결 시도
+		c.rpcMutex.RUnlock()
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return "", fmt.Errorf("failed to reconnect: %w", err)
+		}
+		c.rpcMutex.RLock()
+
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return "", ErrRPCNotConnected
+		}
 	}
 
 	// Tendermint ABCI Query를 사용하여 마지막 무확인 마일스톤 조회
@@ -999,7 +812,18 @@ func (c *TendermintABCIClient) FetchMilestoneID(ctx context.Context, milestoneID
 	defer c.rpcMutex.RUnlock()
 
 	if !c.isRPCConnected {
-		return ErrRPCNotConnected
+		// 연결이 끊어진 경우 재연결 시도
+		c.rpcMutex.RUnlock()
+		if err := c.ReconnectIfNeeded(); err != nil {
+			c.rpcMutex.RLock()
+			return fmt.Errorf("failed to reconnect: %w", err)
+		}
+		c.rpcMutex.RLock()
+
+		// 여전히 연결이 안 된 경우
+		if !c.isRPCConnected {
+			return ErrRPCNotConnected
+		}
 	}
 
 	// Tendermint ABCI Query를 사용하여 마일스톤 ID 조회
@@ -1033,39 +857,62 @@ func (c *TendermintABCIClient) FetchMilestoneID(ctx context.Context, milestoneID
 	return nil
 }
 
-// ReconnectIfNeeded checks the connection status and attempts to reconnect if necessary
-// It returns true if the connection is established or re-established, false otherwise
-func (c *TendermintABCIClient) ReconnectIfNeeded() (bool, error) {
-	// 첫 번째로 ABCI 연결 확인 및 재연결
+// ReconnectIfNeeded는 ABCI 또는 RPC 클라이언트의 연결이 끊어진 경우 자동으로 재연결을 시도합니다.
+// 최대 3번까지 재시도하며, 모든 시도가 실패하면 오류를 반환합니다.
+func (c *TendermintABCIClient) ReconnectIfNeeded() error {
+	var abciErr, rpcErr error
+	maxRetries := 3
+
+	// ABCI 클라이언트 재연결
 	c.abciMutex.RLock()
-	abciConnected := c.isABCIConnected
+	abciConnected := c.isABCIConnected && c.abciClient != nil && c.abciClient.IsRunning()
 	c.abciMutex.RUnlock()
 
 	if !abciConnected {
-		log.Warn("ABCI client not connected, attempting to reconnect")
-		err := c.connectABCI()
-		if err != nil {
-			log.Error("Failed to reconnect ABCI client", "error", err)
-			return false, fmt.Errorf("failed to reconnect ABCI client: %w", err)
+		log.Warn("ABCI client is not connected, attempting to reconnect")
+
+		for i := 0; i < maxRetries; i++ {
+			abciErr = c.connectABCI()
+			if abciErr == nil {
+				log.Info("Successfully reconnected to ABCI endpoint")
+				break
+			}
+
+			log.Warn("Failed to reconnect to ABCI endpoint", "attempt", i+1, "error", abciErr)
+			time.Sleep(dialRetryDelay)
 		}
 	}
 
-	// 그 다음 RPC 연결 확인 및 재연결
+	// RPC 클라이언트 재연결
 	c.rpcMutex.RLock()
-	rpcConnected := c.isRPCConnected
+	rpcConnected := c.isRPCConnected && c.rpcClient != nil
 	c.rpcMutex.RUnlock()
 
 	if !rpcConnected {
-		log.Warn("RPC client not connected, attempting to reconnect")
-		err := c.connectRPC()
-		if err != nil {
-			log.Error("Failed to reconnect RPC client", "error", err)
-			return false, fmt.Errorf("failed to reconnect RPC client: %w", err)
+		log.Warn("RPC client is not connected, attempting to reconnect")
+
+		for i := 0; i < maxRetries; i++ {
+			rpcErr = c.connectRPC()
+			if rpcErr == nil {
+				log.Info("Successfully reconnected to RPC endpoint")
+				break
+			}
+
+			log.Warn("Failed to reconnect to RPC endpoint", "attempt", i+1, "error", rpcErr)
+			time.Sleep(dialRetryDelay)
 		}
 	}
 
-	// 양쪽 모두 연결 상태 확인
-	return c.IsConnected(), nil
+	// 오류 반환
+	if abciErr != nil && rpcErr != nil {
+		return fmt.Errorf("failed to reconnect to both ABCI and RPC endpoints: ABCI: %v, RPC: %v", abciErr, rpcErr)
+	} else if abciErr != nil {
+		return fmt.Errorf("failed to reconnect to ABCI endpoint: %v", abciErr)
+	} else if rpcErr != nil {
+		return fmt.Errorf("failed to reconnect to RPC endpoint: %v", rpcErr)
+	}
+
+	return nil
 }
 
 // Close 메서드 - 클라이언트 연결 종료
