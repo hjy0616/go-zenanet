@@ -1606,12 +1606,12 @@ func (c *Eirene) CommitStates(
 	// Fetch the LastStateId from contract via current state instance
 	lastStateIDBig, err = c.GenesisContractsClient.LastStateId(state.Copy(), number-1, header.ParentHash)
 	if err != nil {
-		log.Error("Failed to fetch last state ID", "error", err, "block", number)
-		return nil, fmt.Errorf("failed to fetch last state ID: %w", err)
+		return nil, err
 	}
 
 	// Tendermint에서는 이전 블록 타임스탬프를 toTimestamp로 사용
 	// Tendermint의 블록 생성 주기에 따라 적절한 값을 선택해야 함
+	// 이전 스프린트의 마지막 블록 시간으로 설정
 	stateSyncDelay := c.config.CalculateStateSyncDelay(number)
 	toTimestamp = int64(header.Time - stateSyncDelay)
 
@@ -1621,52 +1621,21 @@ func (c *Eirene) CommitStates(
 	log.Info(
 		"Fetching state updates from Tendermint",
 		"fromID", from,
-		"toTimestamp", toTimestamp,
-		"block", number)
-
-	// 상태 동기화 이벤트 조회 시 컨텍스트 생성
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+		"toTimestamp", toTimestamp)
 
 	// Tendermint ABCI 클라이언트를 통해 상태 동기화 이벤트 조회
-	eventRecords, err := c.TendermintClient.StateSyncEvents(ctx, from, toTimestamp)
+	eventRecords, err := c.TendermintClient.StateSyncEvents(context.Background(), from, toTimestamp)
 	if err != nil {
-		log.Error("Error occurred when fetching state sync events",
-			"fromID", from,
-			"toTimestamp", toTimestamp,
-			"block", number,
-			"err", err)
-
-		// 에러가 발생해도 계속 진행, 비어있는 이벤트 목록 사용
+		log.Error("Error occurred when fetching state sync events", "fromID", from, "toTimestamp", toTimestamp, "err", err)
+		// 에러가 발생해도 계속 진행, 이벤트를 가져오지 못한 경우 빈 목록으로 처리
 		eventRecords = []*clerk.EventRecordWithTime{}
 	}
-
-	// 이벤트 정렬 - ID 기준 오름차순
-	sort.Slice(eventRecords, func(i, j int) bool {
-		return eventRecords[i].ID < eventRecords[j].ID
-	})
-
-	// 중복 이벤트 필터링
-	filteredEvents := make([]*clerk.EventRecordWithTime, 0, len(eventRecords))
-	seenEvents := make(map[uint64]bool)
-
-	for _, event := range eventRecords {
-		if !seenEvents[event.ID] {
-			seenEvents[event.ID] = true
-			filteredEvents = append(filteredEvents, event)
-		} else {
-			log.Warn("Filtered duplicate event", "eventID", event.ID, "block", number)
-		}
-	}
-
-	eventRecords = filteredEvents
 
 	// 테스트 환경에서 이벤트 수 조정이 필요한 경우
 	if c.config.OverrideStateSyncRecords != nil {
 		if val, ok := c.config.OverrideStateSyncRecords[strconv.FormatUint(number, 10)]; ok {
 			if val < len(eventRecords) {
 				eventRecords = eventRecords[0:val]
-				log.Info("Overriding state sync records count", "original", len(eventRecords), "overridden", val)
 			}
 		}
 	}
@@ -1678,10 +1647,7 @@ func (c *Eirene) CommitStates(
 	stateSyncs := make([]*types.StateSyncData, 0, len(eventRecords))
 	toTime := time.Unix(toTimestamp, 0)
 
-	var (
-		gasUsed     uint64
-		eventErrors []error
-	)
+	var gasUsed uint64
 
 	for _, eventRecord := range eventRecords {
 		if eventRecord.ID <= lastStateID {
@@ -1691,15 +1657,8 @@ func (c *Eirene) CommitStates(
 
 		// 이벤트 레코드 검증
 		if err = validateEventRecord(eventRecord, number, toTime, lastStateID, chainID); err != nil {
-			eventErrors = append(eventErrors, fmt.Errorf("invalid event record (ID %d): %w", eventRecord.ID, err))
-			log.Error("Invalid event record",
-				"block", number,
-				"toTimestamp", toTimestamp,
-				"eventID", eventRecord.ID,
-				"lastStateID", lastStateID,
-				"error", err.Error())
-			// 단일 이벤트 오류로 인해 전체 프로세스가 중단되지 않도록 계속 진행
-			continue
+			log.Error("Invalid event record", "block", number, "toTimestamp", toTimestamp, "stateID", lastStateID+1, "error", err.Error())
+			break
 		}
 
 		// 상태 동기화 데이터 생성
@@ -1714,40 +1673,18 @@ func (c *Eirene) CommitStates(
 
 		// 상태 동기화 실행
 		// 이 호출은 이벤트를 발생시켜야 함
-		execStart := time.Now()
+		// 수신자 주소가 컨트랙트가 아닌 경우, 실행과 이벤트 발생이 스킵됨
+		// https://github.com/maticnetwork/genesis-contracts/blob/master/contracts/StateReceiver.sol#L27
 		gasUsed, err = c.GenesisContractsClient.CommitState(eventRecord, state, header, chain)
 		if err != nil {
-			eventErrors = append(eventErrors, fmt.Errorf("commit state failed for event (ID %d): %w", eventRecord.ID, err))
-			log.Error("Failed to commit state for event",
-				"block", number,
-				"eventID", eventRecord.ID,
-				"error", err)
-			// 상태 커밋 오류는 중요하므로 여기서 프로세스 중단
-			return nil, fmt.Errorf("failed to commit state for event ID %d: %w", eventRecord.ID, err)
+			return nil, err
 		}
 
-		log.Debug("Committed state for event",
-			"eventID", eventRecord.ID,
-			"gas", gasUsed,
-			"duration", time.Since(execStart))
-
 		totalGas += int(gasUsed)
-		lastStateID = eventRecord.ID
+		lastStateID++
 	}
 
 	processTime := time.Since(processStart)
-
-	// 일부 이벤트에서 오류가 발생했지만 프로세스는 계속 진행된 경우 경고 로그 출력
-	if len(eventErrors) > 0 {
-		errorMsgs := make([]string, len(eventErrors))
-		for i, err := range eventErrors {
-			errorMsgs[i] = err.Error()
-		}
-		log.Warn("Some events had errors during state sync",
-			"block", number,
-			"errorCount", len(eventErrors),
-			"firstError", errorMsgs[0])
-	}
 
 	log.Info("StateSyncData processed",
 		"gas", totalGas,
@@ -1755,69 +1692,86 @@ func (c *Eirene) CommitStates(
 		"lastStateID", lastStateID,
 		"total records", len(eventRecords),
 		"fetch time (ms)", int(fetchTime.Milliseconds()),
-		"process time (ms)", int(processTime.Milliseconds()),
-		"total time (ms)", int((fetchTime + processTime).Milliseconds()))
+		"process time (ms)", int(processTime.Milliseconds()))
 
 	return stateSyncs, nil
 }
 
 func validateEventRecord(eventRecord *clerk.EventRecordWithTime, number uint64, to time.Time, lastStateID uint64, chainID string) error {
-	// 시퀀셜 ID 검증 - 연속되어야 함
-	if lastStateID+1 != eventRecord.ID {
-		return &InvalidStateReceivedError{
-			Number:      number,
-			LastStateID: lastStateID,
-			To:          &to,
-			Event:       eventRecord,
-			Reason:      fmt.Sprintf("non-sequential ID: expected %d, got %d", lastStateID+1, eventRecord.ID),
-		}
-	}
-
-	// 체인 ID 검증
-	if eventRecord.ChainID != chainID {
-		return &InvalidStateReceivedError{
-			Number:      number,
-			LastStateID: lastStateID,
-			To:          &to,
-			Event:       eventRecord,
-			Reason:      fmt.Sprintf("chain ID mismatch: expected %s, got %s", chainID, eventRecord.ChainID),
-		}
-	}
-
-	// 타임스탬프 검증 - 지정된 시간 범위 내에 있어야 함
-	if !eventRecord.Time.Before(to) {
-		return &InvalidStateReceivedError{
-			Number:      number,
-			LastStateID: lastStateID,
-			To:          &to,
-			Event:       eventRecord,
-			Reason:      fmt.Sprintf("event time (%s) not before limit (%s)", eventRecord.Time, to),
-		}
-	}
-
-	// 필수 데이터 존재 여부 검증
-	if len(eventRecord.Data) == 0 {
-		return &InvalidStateReceivedError{
-			Number:      number,
-			LastStateID: lastStateID,
-			To:          &to,
-			Event:       eventRecord,
-			Reason:      "empty event data",
-		}
-	}
-
-	// 컨트랙트 주소 검증
-	if eventRecord.Contract == (common.Address{}) {
-		return &InvalidStateReceivedError{
-			Number:      number,
-			LastStateID: lastStateID,
-			To:          &to,
-			Event:       eventRecord,
-			Reason:      "empty contract address",
-		}
+	// event id should be sequential and event.Time should lie in the range [from, to)
+	if lastStateID+1 != eventRecord.ID || eventRecord.ChainID != chainID || !eventRecord.Time.Before(to) {
+		return &InvalidStateReceivedError{number, lastStateID, &to, eventRecord}
 	}
 
 	return nil
+}
+
+func (c *Eirene) SetTendermintClient(h ITendermintClient) {
+	c.TendermintClient = h
+}
+
+func (c *Eirene) GetCurrentValidators(ctx context.Context, headerHash common.Hash, blockNumber uint64) ([]*valset.Validator, error) {
+	return c.spanner.GetCurrentValidatorsByHash(ctx, headerHash, blockNumber)
+}
+
+//
+// Private methods
+//
+
+func (c *Eirene) getNextTendermintSpanForTest(
+	ctx context.Context,
+	newSpanID uint64,
+	header *types.Header,
+	chain core.ChainContext,
+) (*span.TendermintSpan, error) {
+	headerNumber := header.Number.Uint64()
+
+	spanEirene, err := c.spanner.GetCurrentSpan(ctx, header.ParentHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// get local chain context object
+	localContext := chain.(statefull.ChainContext)
+	// Retrieve the snapshot needed to verify this header and cache it
+	snap, err := c.snapshot(localContext.Chain, headerNumber-1, header.ParentHash, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// new span
+	spanEirene.ID = newSpanID
+	if spanEirene.EndBlock == 0 {
+		spanEirene.StartBlock = 256
+	} else {
+		spanEirene.StartBlock = spanEirene.EndBlock + 1
+	}
+
+	spanEirene.EndBlock = spanEirene.StartBlock + (100 * c.config.CalculateSprint(headerNumber)) - 1
+
+	selectedProducers := make([]valset.Validator, len(snap.ValidatorSet.Validators))
+	for i, v := range snap.ValidatorSet.Validators {
+		selectedProducers[i] = *v
+	}
+
+	tendermintSpan := &span.TendermintSpan{
+		Span:              *spanEirene,
+		ValidatorSet:      *snap.ValidatorSet,
+		SelectedProducers: selectedProducers,
+		ChainID:           c.chainConfig.ChainID.String(),
+	}
+
+	return tendermintSpan, nil
+}
+
+func validatorContains(a []*valset.Validator, x *valset.Validator) (*valset.Validator, bool) {
+	for _, n := range a {
+		if n.Address == x.Address {
+			return n, true
+		}
+	}
+
+	return nil, false
 }
 
 func getUpdatedValidatorSet(oldValidatorSet *valset.ValidatorSet, newVals []*valset.Validator) *valset.ValidatorSet {
@@ -1857,15 +1811,3 @@ func getUpdatedValidatorSet(oldValidatorSet *valset.ValidatorSet, newVals []*val
 func IsSprintStart(number, sprint uint64) bool {
 	return number%sprint == 0
 }
-
-func (c *Eirene) SetTendermintClient(h ITendermintClient) {
-	c.TendermintClient = h
-}
-
-func (c *Eirene) GetCurrentValidators(ctx context.Context, headerHash common.Hash, blockNumber uint64) ([]*valset.Validator, error) {
-	return c.spanner.GetCurrentValidatorsByHash(ctx, headerHash, blockNumber)
-}
-
-//
-// Private methods
-//

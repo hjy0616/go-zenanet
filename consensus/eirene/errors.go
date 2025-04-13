@@ -98,32 +98,19 @@ func (e *WrongDifficultyError) Error() string {
 	)
 }
 
-// InvalidStateReceivedError is returned when processing statesyncs from tendermint
 type InvalidStateReceivedError struct {
 	Number      uint64
 	LastStateID uint64
 	To          *time.Time
 	Event       *clerk.EventRecordWithTime
-	Reason      string
 }
 
 func (e *InvalidStateReceivedError) Error() string {
-	if e.Reason != "" {
-		return fmt.Sprintf(
-			"Invalid state received at block %d. Reason: %s, LastStateID: %d, EventID: %d, EventTime: %s, ToTime: %s",
-			e.Number,
-			e.Reason,
-			e.LastStateID,
-			e.Event.ID,
-			e.Event.Time,
-			*e.To)
-	}
-
 	return fmt.Sprintf(
-		"Invalid state received at block %d. LastStateID: %d, EventID: %d, EventTime: %s, ToTime: %s",
+		"Received invalid event %v at block %d. Requested events until %s. Last state id was %d",
+		e.Event,
 		e.Number,
+		e.To.Format(time.RFC3339),
 		e.LastStateID,
-		e.Event.ID,
-		e.Event.Time,
-		*e.To)
+	)
 }

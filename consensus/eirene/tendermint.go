@@ -56,6 +56,15 @@ type BlockInfo struct {
 	} `json:"data"`
 }
 
+// MempoolInfo는 Tendermint mempool 정보를 나타냅니다.
+type MempoolInfo struct {
+	TxsCount    int      `json:"txs_count"`     // 메모리풀에 있는 트랜잭션 수
+	TotalBytes  int64    `json:"total_bytes"`   // 메모리풀 트랜잭션의 총 크기(바이트)
+	MaxTxs      int      `json:"max_txs"`       // 최대 트랜잭션 수 제한
+	MaxTxsBytes int64    `json:"max_txs_bytes"` // 최대 트랜잭션 바이트 제한
+	PendingTxs  [][]byte `json:"pending_txs"`   // 대기 중인 트랜잭션 목록(선택적)
+}
+
 //go:generate mockgen -destination=../../tests/eirene/mocks/ITendermintClient.go -package=mocks . ITendermintClient
 type ITendermintClient interface {
 	StateSyncEvents(ctx context.Context, fromID uint64, to int64) ([]*clerk.EventRecordWithTime, error)
@@ -78,8 +87,11 @@ type ITendermintClient interface {
 	GetValidators(ctx context.Context) ([]*valset.Validator, error)
 	GetCurrentValidatorSet(ctx context.Context) (*valset.ValidatorSet, error)
 
-	// 블록 정보 조회 메서드 추가
+	// 블록 정보 조회 메서드
 	BlockInfo(ctx context.Context, height *int64) (*BlockInfo, error)
+
+	// 메모리풀 정보 조회 메서드
+	GetMempoolInfo(ctx context.Context, includeTxs bool) (*MempoolInfo, error)
 
 	Connect() error
 	IsConnected() bool
