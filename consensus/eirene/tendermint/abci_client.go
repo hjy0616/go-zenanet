@@ -449,37 +449,60 @@ func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64
 
 // FetchCheckpointCount는 체크포인트의 총 개수를 조회합니다.
 func (c *TendermintABCIClient) FetchCheckpointCount(ctx context.Context) (int64, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	maxRetries := 3
+	var err error
 
-	if !c.isRPCConnected {
-		return 0, ErrRPCNotConnected
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			log.Warn("Retrying to fetch checkpoint count", "attempt", i)
+		}
+
+		// 연결 상태 확인 및 재연결 시도
+		if err = c.ReconnectIfNeeded(); err != nil {
+			log.Error("Failed to reconnect", "err", err)
+			continue
+		}
+
+		c.rpcMutex.RLock()
+		if !c.isRPCConnected {
+			c.rpcMutex.RUnlock()
+			err = ErrRPCNotConnected
+			continue
+		}
+
+		// Tendermint ABCI Query를 사용하여 체크포인트 개수 조회
+		path := "checkpoint/count"
+		queryResult, queryErr := c.rpcClient.ABCIQuery(ctx, path, nil)
+		c.rpcMutex.RUnlock()
+
+		if queryErr != nil {
+			err = fmt.Errorf("failed to query checkpoint count: %w", queryErr)
+			continue
+		}
+
+		if queryResult.Response.Code != 0 {
+			err = fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+			continue
+		}
+
+		// 응답 데이터가 없는 경우
+		if len(queryResult.Response.Value) == 0 {
+			err = fmt.Errorf("checkpoint count not found")
+			continue
+		}
+
+		// 응답 데이터를 CheckpointCount 응답으로 언마샬
+		var countResp checkpoint.CheckpointCountResponse
+		if unmarshalErr := json.Unmarshal(queryResult.Response.Value, &countResp); unmarshalErr != nil {
+			err = fmt.Errorf("failed to unmarshal checkpoint count data: %w", unmarshalErr)
+			continue
+		}
+
+		return countResp.Result.Result, nil
 	}
 
-	// Tendermint ABCI Query를 사용하여 체크포인트 개수 조회
-	path := "checkpoint/count"
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to query checkpoint count: %w", err)
-	}
-
-	if queryResult.Response.Code != 0 {
-		return 0, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
-
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return 0, fmt.Errorf("checkpoint count not found")
-	}
-
-	// 응답 데이터를 CheckpointCount 응답으로 언마샬
-	var countResp checkpoint.CheckpointCountResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &countResp); err != nil {
-		return 0, fmt.Errorf("failed to unmarshal checkpoint count data: %w", err)
-	}
-
-	return countResp.Result.Result, nil
+	return 0, fmt.Errorf("failed to fetch checkpoint count after %d attempts: %w", maxRetries, err)
 }
 
 // FetchMilestone는 최신 마일스톤을 조회합니다.
@@ -519,149 +542,356 @@ func (c *TendermintABCIClient) FetchMilestone(ctx context.Context) (*milestone.M
 
 // FetchMilestoneCount는 마일스톤의 총 개수를 조회합니다.
 func (c *TendermintABCIClient) FetchMilestoneCount(ctx context.Context) (int64, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	maxRetries := 3
+	var err error
 
-	if !c.isRPCConnected {
-		return 0, ErrRPCNotConnected
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			log.Warn("Retrying to fetch milestone count", "attempt", i)
+		}
+
+		// 연결 상태 확인 및 재연결 시도
+		if err = c.ReconnectIfNeeded(); err != nil {
+			log.Error("Failed to reconnect", "err", err)
+			continue
+		}
+
+		c.rpcMutex.RLock()
+		if !c.isRPCConnected {
+			c.rpcMutex.RUnlock()
+			err = ErrRPCNotConnected
+			continue
+		}
+
+		// Tendermint ABCI Query를 사용하여 마일스톤 개수 조회
+		path := "milestone/count"
+		queryResult, queryErr := c.rpcClient.ABCIQuery(ctx, path, nil)
+		c.rpcMutex.RUnlock()
+
+		if queryErr != nil {
+			err = fmt.Errorf("failed to query milestone count: %w", queryErr)
+			continue
+		}
+
+		if queryResult.Response.Code != 0 {
+			err = fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+			continue
+		}
+
+		// 응답 데이터가 없는 경우
+		if len(queryResult.Response.Value) == 0 {
+			err = fmt.Errorf("milestone count not found")
+			continue
+		}
+
+		// 응답 데이터를 MilestoneCount 응답으로 언마샬
+		var countResp milestone.MilestoneCountResponse
+		if unmarshalErr := json.Unmarshal(queryResult.Response.Value, &countResp); unmarshalErr != nil {
+			err = fmt.Errorf("failed to unmarshal milestone count data: %w", unmarshalErr)
+			continue
+		}
+
+		return countResp.Result.Count, nil
 	}
 
-	// Tendermint ABCI Query를 사용하여 마일스톤 개수 조회
-	path := "milestone/count"
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to query milestone count: %w", err)
-	}
-
-	if queryResult.Response.Code != 0 {
-		return 0, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
-
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return 0, fmt.Errorf("milestone count not found")
-	}
-
-	// 응답 데이터를 MilestoneCount 응답으로 언마샬
-	var countResp milestone.MilestoneCountResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &countResp); err != nil {
-		return 0, fmt.Errorf("failed to unmarshal milestone count data: %w", err)
-	}
-
-	return countResp.Result.Count, nil
+	return 0, fmt.Errorf("failed to fetch milestone count after %d attempts: %w", maxRetries, err)
 }
 
 // FetchNoAckMilestone는 특정 ID의 마일스톤이 Tendermint에서 실패했는지 여부를 조회합니다.
 func (c *TendermintABCIClient) FetchNoAckMilestone(ctx context.Context, milestoneID string) error {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	maxRetries := 3
+	var err error
 
-	if !c.isRPCConnected {
-		return ErrRPCNotConnected
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			log.Warn("Retrying to fetch no ack milestone", "attempt", i, "milestoneID", milestoneID)
+		}
+
+		// 연결 상태 확인 및 재연결 시도
+		if err = c.ReconnectIfNeeded(); err != nil {
+			log.Error("Failed to reconnect", "err", err)
+			continue
+		}
+
+		c.rpcMutex.RLock()
+		if !c.isRPCConnected {
+			c.rpcMutex.RUnlock()
+			err = ErrRPCNotConnected
+			continue
+		}
+
+		// Tendermint ABCI Query를 사용하여 실패한 마일스톤 조회
+		path := fmt.Sprintf("milestone/no-ack/%s", milestoneID)
+		queryResult, queryErr := c.rpcClient.ABCIQuery(ctx, path, nil)
+		c.rpcMutex.RUnlock()
+
+		if queryErr != nil {
+			err = fmt.Errorf("failed to query no-ack milestone: %w", queryErr)
+			continue
+		}
+
+		if queryResult.Response.Code != 0 {
+			err = fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+			continue
+		}
+
+		// 응답 데이터가 없는 경우는 마일스톤이 실패하지 않았음을 의미
+		if len(queryResult.Response.Value) == 0 {
+			return nil
+		}
+
+		// 응답 데이터를 boolean으로 언마샬
+		var isFailed bool
+		if unmarshalErr := json.Unmarshal(queryResult.Response.Value, &isFailed); unmarshalErr != nil {
+			err = fmt.Errorf("failed to unmarshal no-ack milestone data: %w", unmarshalErr)
+			continue
+		}
+
+		// isFailed가 true이면 마일스톤이 실패한 것
+		if isFailed {
+			return fmt.Errorf("milestone %s failed in Tendermint", milestoneID)
+		}
+
+		return nil
 	}
 
-	// Tendermint ABCI Query를 사용하여 마일스톤 무확인 상태 조회
-	path := fmt.Sprintf("milestone/no-ack/%s", milestoneID)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return fmt.Errorf("failed to query milestone no-ack: %w", err)
-	}
-
-	if queryResult.Response.Code != 0 {
-		return fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
-
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return fmt.Errorf("milestone no-ack information not found for ID %s", milestoneID)
-	}
-
-	// 응답 데이터를 MilestoneNoAck 응답으로 언마샬
-	var noAckResp milestone.MilestoneNoAckResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &noAckResp); err != nil {
-		return fmt.Errorf("failed to unmarshal milestone no-ack data: %w", err)
-	}
-
-	// 마일스톤이 실패한 경우 오류 반환
-	if noAckResp.Result.Result {
-		return fmt.Errorf("milestone %s failed in Tendermint", milestoneID)
-	}
-
-	return nil
+	return fmt.Errorf("failed to fetch no-ack milestone after %d attempts: %w", maxRetries, err)
 }
 
 // FetchLastNoAckMilestone는 가장 최근에 실패한 마일스톤 ID를 조회합니다.
 func (c *TendermintABCIClient) FetchLastNoAckMilestone(ctx context.Context) (string, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	maxRetries := 3
+	var err error
 
-	if !c.isRPCConnected {
-		return "", ErrRPCNotConnected
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			log.Warn("Retrying to fetch last no-ack milestone", "attempt", i)
+		}
+
+		// 연결 상태 확인 및 재연결 시도
+		if err = c.ReconnectIfNeeded(); err != nil {
+			log.Error("Failed to reconnect", "err", err)
+			continue
+		}
+
+		c.rpcMutex.RLock()
+		if !c.isRPCConnected {
+			c.rpcMutex.RUnlock()
+			err = ErrRPCNotConnected
+			continue
+		}
+
+		// Tendermint ABCI Query를 사용하여 마지막으로 실패한 마일스톤 조회
+		path := "milestone/last-no-ack"
+		queryResult, queryErr := c.rpcClient.ABCIQuery(ctx, path, nil)
+		c.rpcMutex.RUnlock()
+
+		if queryErr != nil {
+			err = fmt.Errorf("failed to query last no-ack milestone: %w", queryErr)
+			continue
+		}
+
+		if queryResult.Response.Code != 0 {
+			err = fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+			continue
+		}
+
+		// 응답 데이터가 없는 경우는 실패한 마일스톤이 없음을 의미
+		if len(queryResult.Response.Value) == 0 {
+			return "", nil
+		}
+
+		// 응답 데이터에서 마일스톤 ID 언마샬
+		var milestoneID string
+		if unmarshalErr := json.Unmarshal(queryResult.Response.Value, &milestoneID); unmarshalErr != nil {
+			err = fmt.Errorf("failed to unmarshal last no-ack milestone data: %w", unmarshalErr)
+			continue
+		}
+
+		return milestoneID, nil
 	}
 
-	// Tendermint ABCI Query를 사용하여 마지막 무확인 마일스톤 조회
-	path := "milestone/last-no-ack"
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to query last no-ack milestone: %w", err)
-	}
-
-	if queryResult.Response.Code != 0 {
-		return "", fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
-
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return "", fmt.Errorf("last no-ack milestone not found")
-	}
-
-	// 응답 데이터를 MilestoneLastNoAck 응답으로 언마샬
-	var lastNoAckResp milestone.MilestoneLastNoAckResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &lastNoAckResp); err != nil {
-		return "", fmt.Errorf("failed to unmarshal last no-ack milestone data: %w", err)
-	}
-
-	return lastNoAckResp.Result.Result, nil
+	return "", fmt.Errorf("failed to fetch last no-ack milestone after %d attempts: %w", maxRetries, err)
 }
 
 // FetchMilestoneID는 특정 ID의 마일스톤이 Tendermint에서 처리 중인지 여부를 조회합니다.
 func (c *TendermintABCIClient) FetchMilestoneID(ctx context.Context, milestoneID string) error {
+	maxRetries := 3
+	var err error
+
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			log.Warn("Retrying to fetch milestone ID", "attempt", i, "milestoneID", milestoneID)
+		}
+
+		// 연결 상태 확인 및 재연결 시도
+		if err = c.ReconnectIfNeeded(); err != nil {
+			log.Error("Failed to reconnect", "err", err)
+			continue
+		}
+
+		c.rpcMutex.RLock()
+		if !c.isRPCConnected {
+			c.rpcMutex.RUnlock()
+			err = ErrRPCNotConnected
+			continue
+		}
+
+		// Tendermint ABCI Query를 사용하여 마일스톤 처리 상태 조회
+		path := fmt.Sprintf("milestone/process/%s", milestoneID)
+		queryResult, queryErr := c.rpcClient.ABCIQuery(ctx, path, nil)
+		c.rpcMutex.RUnlock()
+
+		if queryErr != nil {
+			err = fmt.Errorf("failed to query milestone process status: %w", queryErr)
+			continue
+		}
+
+		if queryResult.Response.Code != 0 {
+			err = fmt.Errorf("query failed with code %d: %s",
+				queryResult.Response.Code, queryResult.Response.Log)
+			continue
+		}
+
+		// 응답 데이터가 없는 경우는 마일스톤이 처리 중이 아님을 의미
+		if len(queryResult.Response.Value) == 0 {
+			return fmt.Errorf("milestone %s is not in process", milestoneID)
+		}
+
+		// 응답 데이터를 boolean으로 언마샬
+		var isInProcess bool
+		if unmarshalErr := json.Unmarshal(queryResult.Response.Value, &isInProcess); unmarshalErr != nil {
+			err = fmt.Errorf("failed to unmarshal milestone process data: %w", unmarshalErr)
+			continue
+		}
+
+		// isInProcess가 false이면 마일스톤이 처리 중이 아님
+		if !isInProcess {
+			return fmt.Errorf("milestone %s is not in process", milestoneID)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("failed to fetch milestone process status after %d attempts: %w", maxRetries, err)
+}
+
+// BlockInfo는 특정 높이의 블록 정보를 조회합니다.
+func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*eirene.BlockInfo, error) {
+	maxRetries := 3
+	var err error
+
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			log.Warn("Retrying to fetch block info", "attempt", i, "height", height)
+		}
+
+		// 연결 상태 확인 및 재연결 시도
+		if err = c.ReconnectIfNeeded(); err != nil {
+			log.Error("Failed to reconnect", "err", err)
+			continue
+		}
+
+		c.rpcMutex.RLock()
+		if !c.isRPCConnected {
+			c.rpcMutex.RUnlock()
+			err = ErrRPCNotConnected
+			continue
+		}
+
+		// Tendermint RPC를 사용하여 블록 정보 조회
+		var blockData map[string]interface{}
+		var queryErr error
+
+		if height == nil {
+			// 높이가 지정되지 않으면 최신 블록 조회
+			blockResp, blockErr := c.rpcClient.Call(ctx, "block", map[string]interface{}{})
+			queryErr = blockErr
+			if blockErr == nil && blockResp.Result != nil {
+				blockData = blockResp.Result.(map[string]interface{})
+			}
+		} else {
+			// 지정된 높이의 블록 조회
+			blockResp, blockErr := c.rpcClient.Call(ctx, "block", map[string]interface{}{"height": *height})
+			queryErr = blockErr
+			if blockErr == nil && blockResp.Result != nil {
+				blockData = blockResp.Result.(map[string]interface{})
+			}
+		}
+
+		c.rpcMutex.RUnlock()
+
+		if queryErr != nil {
+			err = fmt.Errorf("failed to query block info: %w", queryErr)
+			continue
+		}
+
+		// 결과가 없는 경우
+		if blockData == nil {
+			err = fmt.Errorf("no block found for height %v", height)
+			continue
+		}
+
+		// JSON 응답에서 필요한 데이터 추출
+		blockInfo := &eirene.BlockInfo{}
+		// JSON 파싱 로직 구현
+		// 이 부분은 실제 응답 구조에 맞게 구현해야 합니다
+
+		// 간략한 구현 예시
+		if blockIDData, ok := blockData["block_id"].(map[string]interface{}); ok {
+			if hash, ok := blockIDData["hash"].([]byte); ok {
+				blockInfo.BlockID.Hash = hash
+			}
+		}
+
+		if blockData, ok := blockData["block"].(map[string]interface{}); ok {
+			if headerData, ok := blockData["header"].(map[string]interface{}); ok {
+				if height, ok := headerData["height"].(int64); ok {
+					blockInfo.Header.Height = height
+				}
+				if chainID, ok := headerData["chain_id"].(string); ok {
+					blockInfo.Header.ChainID = chainID
+				}
+				// 기타 필드 파싱...
+			}
+		}
+
+		return blockInfo, nil
+	}
+
+	return nil, fmt.Errorf("failed to fetch block info after %d attempts: %w", maxRetries, err)
+}
+
+// ReconnectIfNeeded는 필요한 경우 ABCI 및 RPC 클라이언트를 재연결합니다.
+func (c *TendermintABCIClient) ReconnectIfNeeded() error {
+	c.abciMutex.RLock()
+	abciConnected := c.isABCIConnected
+	c.abciMutex.RUnlock()
+
 	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
+	rpcConnected := c.isRPCConnected
+	c.rpcMutex.RUnlock()
 
-	if !c.isRPCConnected {
-		return ErrRPCNotConnected
+	// 둘 다 연결되어 있으면 재연결 필요 없음
+	if abciConnected && rpcConnected {
+		return nil
 	}
 
-	// Tendermint ABCI Query를 사용하여 마일스톤 ID 조회
-	path := fmt.Sprintf("milestone/id/%s", milestoneID)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return fmt.Errorf("failed to query milestone ID: %w", err)
+	// ABCI가 연결되어 있지 않으면 재연결 시도
+	if !abciConnected {
+		if err := c.connectABCI(); err != nil {
+			return fmt.Errorf("failed to reconnect ABCI client: %w", err)
+		}
 	}
 
-	if queryResult.Response.Code != 0 {
-		return fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
-	}
-
-	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
-		return fmt.Errorf("milestone ID information not found for ID %s", milestoneID)
-	}
-
-	// 응답 데이터를 MilestoneID 응답으로 언마샬
-	var idResp milestone.MilestoneIDResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &idResp); err != nil {
-		return fmt.Errorf("failed to unmarshal milestone ID data: %w", err)
-	}
-
-	// 마일스톤이 처리 중이 아닌 경우 오류 반환
-	if !idResp.Result.Result {
-		return fmt.Errorf("milestone %s is not in process in Tendermint", milestoneID)
+	// RPC가 연결되어 있지 않으면 재연결 시도
+	if !rpcConnected {
+		if err := c.connectRPC(); err != nil {
+			return fmt.Errorf("failed to reconnect RPC client: %w", err)
+		}
 	}
 
 	return nil
@@ -686,76 +916,4 @@ func (c *TendermintABCIClient) Close() {
 	c.rpcMutex.Unlock()
 
 	close(c.closeCh)
-}
-
-// BlockInfo 메서드는 특정 높이의 블록 정보를 조회합니다.
-func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*eirene.BlockInfo, error) {
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
-
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
-	}
-
-	// Tendermint RPC를 통해 블록 정보 조회
-	result, err := c.rpcClient.Block(ctx, height)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get block info: %w", err)
-	}
-
-	if result.BlockID.Hash == nil || result.Block == nil {
-		return nil, fmt.Errorf("invalid block response: empty block data")
-	}
-
-	// 블록 정보 변환
-	blockInfo := &eirene.BlockInfo{
-		BlockID: eirene.BlockID{
-			Hash: result.BlockID.Hash,
-		},
-		Header: eirene.BlockHeader{
-			ChainID:         result.Block.ChainID,
-			Height:          result.Block.Height,
-			Time:            result.Block.Time,
-			DataHash:        result.Block.DataHash,
-			AppHash:         result.Block.AppHash,
-			ProposerAddress: result.Block.ProposerAddress,
-		},
-	}
-
-	// Parts Header 설정
-	blockInfo.BlockID.PartsHeader.Total = result.BlockID.PartSetHeader.Total
-	blockInfo.BlockID.PartsHeader.Hash = result.BlockID.PartSetHeader.Hash
-
-	// Version 설정
-	blockInfo.Header.Version.Block = uint64(result.Block.Version.Block)
-	blockInfo.Header.Version.App = uint64(result.Block.Version.App)
-
-	// 트랜잭션 데이터 설정
-	blockInfo.Data.Txs = make([][]byte, len(result.Block.Txs))
-	for i, tx := range result.Block.Txs {
-		blockInfo.Data.Txs[i] = tx
-	}
-
-	// 해시 데이터 설정
-	blockInfo.Header.ValidatorsHash = result.Block.ValidatorsHash
-	blockInfo.Header.NextValidatorsHash = result.Block.NextValidatorsHash
-	blockInfo.Header.ConsensusHash = result.Block.ConsensusHash
-	blockInfo.Header.LastResultsHash = result.Block.LastResultsHash
-	blockInfo.Header.EvidenceHash = result.Block.EvidenceHash
-
-	// LastBlockID 설정
-	blockInfo.Header.LastBlockID.Hash = result.Block.LastBlockID.Hash
-	blockInfo.Header.LastBlockID.PartsHeader.Total = result.Block.LastBlockID.PartSetHeader.Total
-	blockInfo.Header.LastBlockID.PartsHeader.Hash = result.Block.LastBlockID.PartSetHeader.Hash
-
-	// LastCommit 설정
-	if result.Block.LastCommit != nil {
-		blockInfo.Header.LastCommit.Height = result.Block.LastCommit.Height
-		blockInfo.Header.LastCommit.Round = result.Block.LastCommit.Round
-		blockInfo.Header.LastCommit.BlockID.Hash = result.Block.LastCommit.BlockID.Hash
-		blockInfo.Header.LastCommit.BlockID.PartsHeader.Total = result.Block.LastCommit.BlockID.PartSetHeader.Total
-		blockInfo.Header.LastCommit.BlockID.PartsHeader.Hash = result.Block.LastCommit.BlockID.PartSetHeader.Hash
-	}
-
-	return blockInfo, nil
 }
