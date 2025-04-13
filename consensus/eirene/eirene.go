@@ -313,50 +313,22 @@ func (c *Eirene) SetSpanner(spanner Spanner) {
 // method returns a quit channel to aeirenet the operations and a results channel to
 // retrieve the async verifications (the order is that of the input slice).
 func (c *Eirene) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header) (chan<- struct{}, <-chan error) {
-	abort := make(chan struct{})
+	aeirenet := make(chan struct{})
 	results := make(chan error, len(headers))
 
-	// Tendermint 활성화 상태면 일괄 처리 최적화
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		go func() {
-			// 블록 번호 추출 (나중에 사용할 수 있도록 준비)
-			blockNumbers := make([]int64, 0, len(headers))
-			for _, header := range headers {
-				if header.Number != nil {
-					blockNumbers = append(blockNumbers, header.Number.Int64())
-				}
+	go func() {
+		for i, header := range headers {
+			err := c.verifyHeader(chain, header, headers[:i])
+
+			select {
+			case <-aeirenet:
+				return
+			case results <- err:
 			}
+		}
+	}()
 
-			// 향후 Tendermint에 블록 정보 일괄 요청 메서드가 구현되면 사용
-			// 현재는 blockNumbers 변수만 준비하고 실제 요청은 각 헤더별로 수행
-
-			// 일반적인 검증 로직 수행
-			for i, header := range headers {
-				err := c.verifyHeader(chain, header, headers[:i])
-
-				select {
-				case <-abort:
-					return
-				case results <- err:
-				}
-			}
-		}()
-	} else {
-		// 기존 로직 유지
-		go func() {
-			for i, header := range headers {
-				err := c.verifyHeader(chain, header, headers[:i])
-
-				select {
-				case <-abort:
-					return
-				case results <- err:
-				}
-			}
-		}()
-	}
-
-	return abort, results
+	return aeirenet, results
 }
 
 // verifyHeader checks whether a header conforms to the consensus rules.The
@@ -907,72 +879,70 @@ func (c *Eirene) VerifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 // headers that aren't yet part of the local blockchain to generate the snapshots
 // from.
 func (c *Eirene) verifySeal(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
-	// 개발 환경에서의 검증 우회 (fakeDiff 모드)
-	if c.fakeDiff {
-		return nil
-	}
-
+	// Verifying the genesis block is not supported
 	number := header.Number.Uint64()
-	// Resolving the authorization key and check against signers
-	signer, err := ecrecover(header, c.signatures, c.config)
-	if err != nil {
-		return err
+	if number == 0 {
+		return errUnknownBlock
 	}
-
-	// Tendermint 통합 모드에서 검증 과정 보강
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		// 블록 서명자 검증을 Tendermint 데이터와 비교
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		// 블록의 실제 서명자와 Tendermint의 제안자가 일치하는지 확인
-		blockHeight := int64(number)
-		tmBlock, err := c.TendermintClient.BlockInfo(ctx, &blockHeight)
-
-		if err == nil && tmBlock != nil {
-			// Tendermint 블록 제안자 주소 추출
-			proposerAddrBytes := tmBlock.Header.ProposerAddress
-
-			// 제안자 주소가 Ethereum 주소 형식(20바이트)과 일치하는지 확인
-			if len(proposerAddrBytes) == 20 {
-				tmProposerAddr := common.BytesToAddress(proposerAddrBytes)
-
-				// 서명자와 Tendermint 제안자 비교 (참고용 로깅)
-				log.Debug("Comparing block signers",
-					"geth_signer", signer.Hex(),
-					"tendermint_proposer", tmProposerAddr.Hex())
-
-				// 향후 서명자-제안자 검증 로직을 여기에 구현할 수 있음
-				// 현재는 로깅만 수행 (통합 초기 단계이므로)
-			}
-		}
-	}
-
-	// 스냅샷에서 서명자 유효성 검증
+	// Retrieve the snapshot needed to verify this header and cache it
 	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents)
 	if err != nil {
 		return err
 	}
 
+	// Tendermint 통합 모드에서 다른 검증 로직 사용
+	usingTendermint := c.TendermintClient != nil && c.TendermintClient.IsConnected()
+
+	// 서명자 복구
+	signer, err := ecrecover(header, c.signatures, c.config)
+	if err != nil {
+		return err
+	}
+
+	// 서명자가 현재 검증자 세트에 있는지 확인
 	if !snap.ValidatorSet.HasAddress(signer) {
-		return &UnauthorizedSignerError{number, signer.Bytes()}
+		// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
+		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
 	}
 
-	// 블록 타임스탬프 검증
-	parent := chain.GetHeader(header.ParentHash, number-1)
-	if parent == nil {
-		return consensus.ErrUnknownAncestor
-	}
-
-	// 서명자의 순서 번호 확인
+	// 검증자 세트에서 서명자의 순서 확인
 	succession, err := snap.GetSignerSuccessionNumber(signer)
 	if err != nil {
 		return err
 	}
 
-	// 블록 타임이 올바른지 확인
-	if !IsBlockOnTime(parent, header, number, succession, c.config) {
-		return ErrInvalidTimestamp
+	// 부모 블록 가져오기
+	var parent *types.Header
+	if len(parents) > 0 {
+		parent = parents[len(parents)-1]
+	} else if number > 0 {
+		parent = chain.GetHeader(header.ParentHash, number-1)
+	}
+
+	// 블록 타이밍 검증
+	if usingTendermint {
+		// Tendermint 모드에서는 블록 타이밍 검증을 간소화
+		// Tendermint가 이미 블록 생성 타이밍을 제어하므로 최소한의 검증만 수행
+		if parent != nil && header.Time < parent.Time {
+			log.Warn("Block time before parent",
+				"block", number,
+				"block_time", time.Unix(int64(header.Time), 0),
+				"parent_time", time.Unix(int64(parent.Time), 0))
+			return &BlockTooSoonError{number, succession}
+		}
+	} else {
+		// 일반 모드에서는 전체 블록 타이밍 검증 수행
+		if parent != nil && header.Time < parent.Time+CalcProducerDelay(number, succession, c.config) {
+			return &BlockTooSoonError{number, succession}
+		}
+	}
+
+	// 난이도 검증 (테스트 모드가 아닌 경우)
+	if !c.fakeDiff {
+		difficulty := Difficulty(snap.ValidatorSet, signer)
+		if header.Difficulty.Uint64() != difficulty {
+			return &WrongDifficultyError{number, difficulty, header.Difficulty.Uint64(), signer.Bytes()}
+		}
 	}
 
 	return nil
@@ -1287,110 +1257,77 @@ func (c *Eirene) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return err
 	}
 
-	// Tendermint 통합 모드에서는 블록 생성 권한 추가 검증
+	// Sweet, the protocol permits us to sign the block, wait for our time
+	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
+	if delay < 0 {
+		// 이미 시간이 지났다면 즉시 서명
+		delay = 0
+	}
+
+	// 블록 타임스탬프 최종 확인 및 조정
 	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		// Tendermint로부터 현재 라운드 정보와 제안자 조회
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Tendermint에서 현재 높이의 블록 정보 확인 (존재하는 경우)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		// 제안자 정보 확인 (가능하면)
-		status, err := c.TendermintClient.Status(ctx)
-		if err == nil && status != nil {
-			log.Debug("Checking Tendermint proposer status before sealing",
-				"height", status.SyncInfo.LatestBlockHeight+1,
-				"our_address", signer.Hex())
+		blockHeight := int64(number)
+		tmBlock, err := c.TendermintClient.BlockInfo(ctx, &blockHeight)
 
-			// 현재 검증자 세트 조회
-			validators, err := c.TendermintClient.GetValidators(ctx)
-			if err == nil && len(validators) > 0 {
-				// Tendermint 검증자 세트에 속해있는지 확인
-				isTendermintValidator := false
-				for _, val := range validators {
-					if val.Address == signer {
-						isTendermintValidator = true
-						break
-					}
-				}
+		if err == nil && tmBlock != nil {
+			// Tendermint 블록이 존재하면 타임스탬프 동기화 고려
+			tmTime := tmBlock.Header.Time.Unix()
+			headerTime := int64(header.Time)
 
-				// Tendermint 검증자가 아니면 블록 생성 권한 없음
-				if !isTendermintValidator {
-					log.Warn("Not a Tendermint validator, skipping block sealing",
-						"signer", signer.Hex())
-					return &UnauthorizedSignerError{number - 1, signer.Bytes()}
+			// 타임스탬프 차이가 크면 로그 출력
+			if tmTime != headerTime {
+				log.Info("Adjusting block timestamp to match Tendermint",
+					"block", number,
+					"original", time.Unix(headerTime, 0),
+					"tendermint", time.Unix(tmTime, 0))
+
+				// 새 타임스탬프로 헤더 업데이트
+				header = types.CopyHeader(header)
+				header.Time = uint64(tmTime)
+
+				// 딜레이 재계산
+				delay = time.Unix(tmTime, 0).Sub(time.Now())
+				if delay < 0 {
+					delay = 0
 				}
 			}
 		}
 	}
 
-	// Sweet, the protocol permits us to sign the block, wait for our time
-	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
-	if header.Difficulty.Cmp(new(big.Int).SetInt64(0)) > 0 {
-		// It's our time to sign, sign it right away
-		if delay < 0 {
-			delay = 0
-		}
-	}
+	log.Info("Sealing block", "number", number, "delay", delay, "succession", succession)
 
 	// Sign all the things!
-	// Sign the block if the delay is acceptable (delay can be +ve here for out-of-turn mining)
-	sealBlockFn := func() error {
-		// Sign the block using the engine's signature
-		if err := Sign(signFn, signer, header, c.config); err != nil {
-			return err
-		}
-
-		// Set the signature
-		newBlock, err := block.WithSeal(header)
-		if err != nil {
-			return err
-		}
-
-		// 블록 생성시 로그 추가 (Tendermint 모드에서 구분)
-		if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-			log.Info("📦 Sealed new block in Tendermint mode",
-				"number", number,
-				"sealhash", SealHash(header, c.config),
-				"signer", signer,
-				"transactions", len(block.Transactions()),
-				"hash", newBlock.Hash())
-		} else {
-			log.Info("📦 Sealed new block",
-				"number", number,
-				"sealhash", SealHash(header, c.config),
-				"signer", signer,
-				"transactions", len(block.Transactions()),
-				"hash", newBlock.Hash())
-		}
-
+	// 지연 대기 및 블록 서명
+	wiggle := time.Duration(len(snap.ValidatorSet.Validators)/2+1) * time.Second
+	go func() {
 		select {
-		case results <- newBlock:
-		default:
-			log.Warn("Sealing result channel is not ready, discarding block")
+		case <-stop:
+			return
+		case <-time.After(delay):
 		}
-
-		return nil
-	}
-
-	// 블록 생성 타이밍 계산
-	if delay > 0 {
-		log.Info("Waiting for slot to sign and propagate",
-			"number", number,
-			"delay", common.PrettyDuration(delay),
-			"signer", signer.Hex(),
-			"succession", succession)
 
 		select {
 		case <-stop:
-			return nil
-		case <-time.After(delay):
+			return
+		case <-time.After(wiggle):
+		default:
 		}
-	}
 
-	// 블록 생성 시도
-	if err := sealBlockFn(); err != nil {
-		log.Error("Failed to seal block", "err", err)
-		return err
-	}
+		// 헤더 복사 후 서명
+		h := header.Copy()
+		if err := Sign(signFn, signer, h, c.config); err != nil {
+			log.Error("Failed to sign header", "err", err)
+			return
+		}
+
+		// 서명된 헤더로 새 블록 생성
+		block := block.WithSeal(h)
+		results <- block
+	}()
 
 	return nil
 }
@@ -1435,53 +1372,57 @@ func Sign(signFn SignerFn, signer common.Address, header *types.Header, c *param
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
-// that a new block should have.
-//
-// - For non-Tendermint mode:
-//   - If signer is in-turn, receive normal difficulty (1)
-//   - If signer is not in-turn, receive higher difficulty (2)
-//
-// - For Tendermint mode:
-//   - Always returns normal difficulty (1) as Tendermint controls the block proposal
+// that a new block should have based on the previous blocks in the chain and the
+// current signer.
 func (c *Eirene) CalcDifficulty(chain consensus.ChainHeaderReader, _ uint64, parent *types.Header) *big.Int {
+	// Tendermint 합의 활성화 여부 확인
+	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
+		// Tendermint 합의에서는 난이도를 다르게 처리
+		// 1: 일반 블록, 2: 스프린트 엔드 블록 등으로 구분 가능
+
+		// 현재 블록 번호 (parent + 1)
+		number := parent.Number.Uint64() + 1
+
+		// 스프린트 엔드 블록인지 확인
+		isSprintEnd := IsSprintStart(number+1, c.config.CalculateSprint(number))
+
+		// 로컬 스냅샷을 통해 검증자 정보 확인
+		snap, err := c.snapshot(chain, parent.Number.Uint64(), parent.Hash(), nil)
+		if err != nil {
+			log.Error("Failed to get snapshot for difficulty calculation", "err", err)
+			return new(big.Int).SetUint64(1) // 기본값 반환
+		}
+
+		// 현재 서명자
+		currentSigner := c.authorizedSigner.Load().signer
+
+		// 현재 노드가 검증자인지 확인
+		if !snap.ValidatorSet.HasAddress(currentSigner) {
+			// 검증자가 아닌 경우 난이도 1 반환
+			return new(big.Int).SetUint64(1)
+		}
+
+		// 현재 노드가 제안자인지 확인
+		proposer := snap.ValidatorSet.GetProposer()
+		if proposer != nil && proposer.Address == currentSigner {
+			// 제안자인 경우 난이도 2 반환 (스프린트 엔드이면 난이도 3)
+			if isSprintEnd {
+				return new(big.Int).SetUint64(3)
+			}
+			return new(big.Int).SetUint64(2)
+		}
+
+		// 제안자가 아니면 난이도 1 반환
+		return new(big.Int).SetUint64(1)
+	}
+
+	// 기존 Eirene 난이도 계산 로직
 	snap, err := c.snapshot(chain, parent.Number.Uint64(), parent.Hash(), nil)
 	if err != nil {
-		return new(big.Int).SetUint64(1)
+		return nil
 	}
 
-	// Tendermint 통합 모드에서는 항상 기본 난이도 반환
-	if c.TendermintClient != nil && c.TendermintClient.IsConnected() {
-		return new(big.Int).SetUint64(1)
-	}
-
-	currentSigner := c.authorizedSigner.Load()
-	if currentSigner == nil {
-		return new(big.Int).SetUint64(1)
-	}
-
-	// 현재 서명자 기반 난이도 계산
-	return new(big.Int).SetUint64(Difficulty(snap.ValidatorSet, currentSigner.signer))
-}
-
-// Difficulty returns the difficulty for a specific signer at a specific time
-// - Validators in turn get normal difficulty (1)
-// - Validators out of turn get higher difficulty (2)
-func Difficulty(validatorSet *valset.ValidatorSet, signer common.Address) uint64 {
-	// 서명자가 검증자 목록에 없으면 높은 난이도 반환
-	if !validatorSet.HasAddress(signer) {
-		return 2
-	}
-
-	// 검증자 목록에서 서명자의 순서와 현재 순서 확인
-	idx := validatorSet.GetIndexByAddress(signer)
-	if idx < 0 {
-		return 2
-	}
-
-	// 현재 순서에 해당하는 검증자가 서명하는 경우 일반 난이도
-	// 그렇지 않은 경우 높은 난이도
-	inTurn := idx == validatorSet.GetProposer().ID
-	return map[bool]uint64{true: 1, false: 2}[inTurn]
+	return new(big.Int).SetUint64(Difficulty(snap.ValidatorSet, c.authorizedSigner.Load().signer))
 }
 
 // SealHash returns the hash of a block prior to it being sealed.

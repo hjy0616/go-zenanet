@@ -2,7 +2,9 @@ package tendermint
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -313,6 +315,11 @@ func (c *TendermintABCIClient) GetCurrentValidatorSet(ctx context.Context) (*val
 
 // StateSyncEvents는 특정 ID부터 지정된 블록까지의 상태 동기화 이벤트를 검색합니다.
 func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint64, to int64) ([]*clerk.EventRecordWithTime, error) {
+	// 연결 상태 확인 및 재연결 시도
+	if err := c.ReconnectIfNeeded(); err != nil {
+		return nil, fmt.Errorf("failed to reconnect: %w", err)
+	}
+
 	c.rpcMutex.RLock()
 	defer c.rpcMutex.RUnlock()
 
@@ -320,17 +327,76 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 		return nil, ErrRPCNotConnected
 	}
 
+	// 재시도 로직 구현
+	var err error
+	var searchResult interface{}
+	maxRetries := 3
+	retryDelay := time.Second
+
 	// Tendermint RPC를 통해 이벤트 조회
-	// 여기서는 tx_search를 사용하여 특정 타입의 이벤트를 조회합니다
 	query := fmt.Sprintf("state_sync.from_id >= %d AND state_sync.to_block <= %d", fromID, to)
-	searchResult, err := c.rpcClient.TxSearch(ctx, query, false, nil, nil, "asc")
+
+	for i := 0; i < maxRetries; i++ {
+		searchResult, err = c.rpcClient.TxSearch(ctx, query, false, nil, nil, "asc")
+		if err == nil {
+			break
+		}
+
+		log.Warn("Failed to search state sync events, retrying",
+			"attempt", i+1,
+			"maxRetries", maxRetries,
+			"error", err)
+
+		if i < maxRetries-1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryDelay):
+				retryDelay *= 2 // 지수 백오프
+			}
+		}
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to search state sync events: %w", err)
+		return nil, fmt.Errorf("failed to search state sync events after %d attempts: %w", maxRetries, err)
+	}
+
+	// 결과를 JSON으로 변환
+	jsonData, err := json.Marshal(searchResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal search result: %w", err)
+	}
+
+	// 간단한 구조체를 정의하여 필요한 정보만 추출
+	type TxEvent struct {
+		Type       string `json:"type"`
+		Attributes []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"attributes"`
+	}
+
+	type TxResult struct {
+		Events []TxEvent `json:"events"`
+	}
+
+	type Tx struct {
+		Hash     string   `json:"hash"`
+		TxResult TxResult `json:"tx_result"`
+	}
+
+	type SearchResult struct {
+		Txs []Tx `json:"txs"`
+	}
+
+	var result SearchResult
+	if err := json.Unmarshal(jsonData, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal search result: %w", err)
 	}
 
 	// 결과를 EventRecordWithTime 형태로 변환
-	events := make([]*clerk.EventRecordWithTime, 0, len(searchResult.Txs))
-	for _, tx := range searchResult.Txs {
+	events := make([]*clerk.EventRecordWithTime, 0, len(result.Txs))
+	for _, tx := range result.Txs {
 		// 각 트랜잭션에서 이벤트 데이터 추출
 		for _, event := range tx.TxResult.Events {
 			if event.Type != "state_sync" {
@@ -342,43 +408,67 @@ func (c *TendermintABCIClient) StateSyncEvents(ctx context.Context, fromID uint6
 			var stateID uint64
 			var recordTime time.Time
 			var data []byte
+			var contract common.Address
+			var txHash common.Hash = common.HexToHash(tx.Hash)
+			var logIndex uint64
+			var chainID string
 
 			for _, attr := range event.Attributes {
-				key := string(attr.Key)
+				key := attr.Key
 				value := attr.Value
 
 				switch key {
 				case "id":
-					id, _ = strconv.ParseUint(string(value), 10, 64)
+					id, _ = strconv.ParseUint(value, 10, 64)
 				case "state_id":
-					stateID, _ = strconv.ParseUint(string(value), 10, 64)
+					stateID, _ = strconv.ParseUint(value, 10, 64)
 				case "time":
-					timeInt, _ := strconv.ParseInt(string(value), 10, 64)
+					timeInt, _ := strconv.ParseInt(value, 10, 64)
 					recordTime = time.Unix(timeInt, 0)
 				case "data":
-					data = value
+					data, _ = hex.DecodeString(value)
+				case "contract":
+					contract = common.HexToAddress(value)
+				case "log_index":
+					logIndex, _ = strconv.ParseUint(value, 10, 64)
+				case "chain_id":
+					chainID = value
 				}
 			}
 
 			// EventRecordWithTime 생성 및 추가
 			record := &clerk.EventRecord{
-				ID:      id,
-				StateID: stateID,
-				Data:    data,
+				ID:       id,
+				StateID:  stateID,
+				Data:     data,
+				Contract: contract,
+				TxHash:   txHash,
+				LogIndex: logIndex,
+				ChainID:  chainID,
 			}
 			eventWithTime := &clerk.EventRecordWithTime{
-				EventRecord: record,
-				RecordTime:  recordTime,
+				EventRecord: *record,
+				Time:        recordTime,
 			}
 			events = append(events, eventWithTime)
 		}
 	}
+
+	log.Info("Retrieved state sync events",
+		"fromID", fromID,
+		"to", to,
+		"count", len(events))
 
 	return events, nil
 }
 
 // Span는 지정된 spanID에 해당하는 Tendermint 스팬 정보를 가져옵니다.
 func (c *TendermintABCIClient) Span(ctx context.Context, spanID uint64) (*span.TendermintSpan, error) {
+	// 연결 상태 확인 및 재연결 시도
+	if err := c.ReconnectIfNeeded(); err != nil {
+		return nil, fmt.Errorf("failed to reconnect: %w", err)
+	}
+
 	c.rpcMutex.RLock()
 	defer c.rpcMutex.RUnlock()
 
@@ -386,34 +476,99 @@ func (c *TendermintABCIClient) Span(ctx context.Context, spanID uint64) (*span.T
 		return nil, ErrRPCNotConnected
 	}
 
+	// 재시도 로직 구현
+	var err error
+	var queryResult interface{}
+	maxRetries := 3
+	retryDelay := time.Second
+
 	// Tendermint ABCI Query를 사용하여 스팬 정보 조회
 	path := fmt.Sprintf("span/%d", spanID)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query span: %w", err)
+
+	for i := 0; i < maxRetries; i++ {
+		queryResult, err = c.rpcClient.ABCIQuery(ctx, path, nil)
+		if err == nil {
+			break
+		}
+
+		log.Warn("Failed to query span, retrying",
+			"spanID", spanID,
+			"attempt", i+1,
+			"maxRetries", maxRetries,
+			"error", err)
+
+		if i < maxRetries-1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryDelay):
+				retryDelay *= 2 // 지수 백오프
+			}
+		}
 	}
 
-	if queryResult.Response.Code != 0 {
+	if err != nil {
+		return nil, fmt.Errorf("failed to query span after %d attempts: %w", maxRetries, err)
+	}
+
+	// 응답 결과를 JSON으로 변환
+	jsonData, err := json.Marshal(queryResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal query result: %w", err)
+	}
+
+	// ABCIQueryResponse 구조체 정의
+	type ABCIQueryResponse struct {
+		Response struct {
+			Code  int    `json:"code"`
+			Log   string `json:"log"`
+			Value string `json:"value"`
+		} `json:"response"`
+	}
+
+	var response ABCIQueryResponse
+	if err := json.Unmarshal(jsonData, &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal query response: %w", err)
+	}
+
+	if response.Response.Code != 0 {
 		return nil, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
+			response.Response.Code, response.Response.Log)
 	}
 
 	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
+	if response.Response.Value == "" {
 		return nil, fmt.Errorf("no span found for ID %d", spanID)
+	}
+
+	// Base64 디코딩
+	valueBytes, err := base64.StdEncoding.DecodeString(response.Response.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 value: %w", err)
 	}
 
 	// 응답 데이터를 TendermintSpan으로 언마샬
 	var tendermintSpan span.TendermintSpan
-	if err := json.Unmarshal(queryResult.Response.Value, &tendermintSpan); err != nil {
+	if err := json.Unmarshal(valueBytes, &tendermintSpan); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal span data: %w", err)
 	}
+
+	log.Info("Retrieved span information",
+		"spanID", spanID,
+		"startBlock", tendermintSpan.StartBlock,
+		"endBlock", tendermintSpan.EndBlock,
+		"validatorCount", len(tendermintSpan.ValidatorSet.Validators))
 
 	return &tendermintSpan, nil
 }
 
 // FetchCheckpoint는 지정된 번호의 체크포인트를 조회합니다.
 func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64) (*checkpoint.Checkpoint, error) {
+	// 연결 상태 확인 및 재연결 시도
+	if err := c.ReconnectIfNeeded(); err != nil {
+		return nil, fmt.Errorf("failed to reconnect: %w", err)
+	}
+
 	c.rpcMutex.RLock()
 	defer c.rpcMutex.RUnlock()
 
@@ -421,28 +576,87 @@ func (c *TendermintABCIClient) FetchCheckpoint(ctx context.Context, number int64
 		return nil, ErrRPCNotConnected
 	}
 
+	// 재시도 로직 구현
+	var err error
+	var queryResult interface{}
+	maxRetries := 3
+	retryDelay := time.Second
+
 	// Tendermint ABCI Query를 사용하여 체크포인트 조회
 	path := fmt.Sprintf("checkpoint/%d", number)
-	queryResult, err := c.rpcClient.ABCIQuery(ctx, path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query checkpoint: %w", err)
+
+	for i := 0; i < maxRetries; i++ {
+		queryResult, err = c.rpcClient.ABCIQuery(ctx, path, nil)
+		if err == nil {
+			break
+		}
+
+		log.Warn("Failed to query checkpoint, retrying",
+			"number", number,
+			"attempt", i+1,
+			"maxRetries", maxRetries,
+			"error", err)
+
+		if i < maxRetries-1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryDelay):
+				retryDelay *= 2 // 지수 백오프
+			}
+		}
 	}
 
-	if queryResult.Response.Code != 0 {
+	if err != nil {
+		return nil, fmt.Errorf("failed to query checkpoint after %d attempts: %w", maxRetries, err)
+	}
+
+	// 응답 결과를 JSON으로 변환
+	jsonData, err := json.Marshal(queryResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal query result: %w", err)
+	}
+
+	// ABCIQueryResponse 구조체 정의
+	type ABCIQueryResponse struct {
+		Response struct {
+			Code  int    `json:"code"`
+			Log   string `json:"log"`
+			Value string `json:"value"`
+		} `json:"response"`
+	}
+
+	var response ABCIQueryResponse
+	if err := json.Unmarshal(jsonData, &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal query response: %w", err)
+	}
+
+	if response.Response.Code != 0 {
 		return nil, fmt.Errorf("query failed with code %d: %s",
-			queryResult.Response.Code, queryResult.Response.Log)
+			response.Response.Code, response.Response.Log)
 	}
 
 	// 응답 데이터가 없는 경우
-	if len(queryResult.Response.Value) == 0 {
+	if response.Response.Value == "" {
 		return nil, fmt.Errorf("no checkpoint found for number %d", number)
+	}
+
+	// Base64 디코딩
+	valueBytes, err := base64.StdEncoding.DecodeString(response.Response.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 value: %w", err)
 	}
 
 	// 응답 데이터를 Checkpoint 응답으로 언마샬
 	var checkpointResp checkpoint.CheckpointResponse
-	if err := json.Unmarshal(queryResult.Response.Value, &checkpointResp); err != nil {
+	if err := json.Unmarshal(valueBytes, &checkpointResp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal checkpoint data: %w", err)
 	}
+
+	log.Info("Retrieved checkpoint",
+		"number", number,
+		"startBlock", checkpointResp.Result.StartBlock,
+		"endBlock", checkpointResp.Result.EndBlock)
 
 	return &checkpointResp.Result, nil
 }
@@ -758,4 +972,44 @@ func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*e
 	}
 
 	return blockInfo, nil
+}
+
+// ReconnectIfNeeded 메서드는 연결이 끊어진 경우 자동으로 재연결을 시도합니다.
+func (c *TendermintABCIClient) ReconnectIfNeeded() error {
+	var abciNeedsReconnect bool
+	var rpcNeedsReconnect bool
+
+	// ABCI 연결 상태 확인
+	c.abciMutex.RLock()
+	if !c.isABCIConnected || (c.abciClient != nil && !c.abciClient.IsRunning()) {
+		abciNeedsReconnect = true
+	}
+	c.abciMutex.RUnlock()
+
+	// RPC 연결 상태 확인
+	c.rpcMutex.RLock()
+	if !c.isRPCConnected || (c.rpcClient != nil && !c.rpcClient.IsRunning()) {
+		rpcNeedsReconnect = true
+	}
+	c.rpcMutex.RUnlock()
+
+	// 필요한 경우 ABCI 재연결
+	if abciNeedsReconnect {
+		log.Warn("ABCI client not connected, attempting to reconnect", "address", c.abciAddr)
+		err := c.connectABCI()
+		if err != nil {
+			return fmt.Errorf("failed to reconnect ABCI client: %w", err)
+		}
+	}
+
+	// 필요한 경우 RPC 재연결
+	if rpcNeedsReconnect {
+		log.Warn("RPC client not connected, attempting to reconnect", "address", c.rpcAddr)
+		err := c.connectRPC()
+		if err != nil {
+			return fmt.Errorf("failed to reconnect RPC client: %w", err)
+		}
+	}
+
+	return nil
 }
