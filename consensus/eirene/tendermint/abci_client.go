@@ -2,7 +2,6 @@ package tendermint
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -37,20 +36,6 @@ const (
 	connectionTimeout = 10 * time.Second
 	// Dial retry delay
 	dialRetryDelay = 3 * time.Second
-	// Max retries for CheckTx and DeliverTx
-	maxRetries = 3
-	// DeliverTx timeout
-	deliverTxTimeout = 10 * time.Second
-	// BlockInfo timeout
-	blockInfoTimeout = 10 * time.Second
-	// InitChain timeout
-	initChainTimeout = 10 * time.Second
-	// Block processing timeout
-	blockProcessingTimeout = 10 * time.Second
-	// Commit timeout
-	commitTimeout = 10 * time.Second
-	// Mempool timeout
-	mempoolTimeout = 10 * time.Second
 )
 
 // TendermintABCIClient implements the ITendermintClient interface for communication with Tendermint via ABCI
@@ -174,11 +159,6 @@ func (c *TendermintABCIClient) IsConnected() bool {
 
 // InitChain implements the ITendermintClient interface
 func (c *TendermintABCIClient) InitChain(ctx context.Context, req types.RequestInitChain) (*types.ResponseInitChain, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.abciMutex.RLock()
 	defer c.abciMutex.RUnlock()
 
@@ -186,53 +166,16 @@ func (c *TendermintABCIClient) InitChain(ctx context.Context, req types.RequestI
 		return nil, ErrABCINotConnected
 	}
 
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, initChainTimeout)
-	defer cancel()
-
-	// 재시도 로직 구현
-	var (
-		resp    abciclient.ResultInitChain
-		retries = 0
-	)
-
-	for retries < maxRetries {
-		// 컨텍스트 취소 확인
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		resp = c.abciClient.InitChainSync(req)
-		if resp.Error == nil {
-			break
-		}
-
-		log.Warn("InitChain failed, retrying", "error", resp.Error, "retry", retries+1)
-		retries++
-
-		if retries < maxRetries {
-			// 지수 백오프 방식으로 대기
-			time.Sleep(time.Second * time.Duration(1<<retries))
-			continue
-		}
-
+	resp := c.abciClient.InitChainSync(req)
+	if resp.Error != nil {
 		return nil, resp.Error
 	}
-
-	log.Info("Chain initialized successfully",
-		"app_hash", fmt.Sprintf("%X", resp.Response.AppHash),
-		"validators", len(resp.Response.Validators))
 
 	return &resp.Response, nil
 }
 
 // BeginBlock implements the ITendermintClient interface
 func (c *TendermintABCIClient) BeginBlock(ctx context.Context, req types.RequestBeginBlock) (*types.ResponseBeginBlock, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.abciMutex.RLock()
 	defer c.abciMutex.RUnlock()
 
@@ -240,55 +183,16 @@ func (c *TendermintABCIClient) BeginBlock(ctx context.Context, req types.Request
 		return nil, ErrABCINotConnected
 	}
 
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, blockProcessingTimeout)
-	defer cancel()
-
-	// 재시도 로직 구현
-	var (
-		resp    abciclient.ResultBeginBlock
-		retries = 0
-	)
-
-	for retries < maxRetries {
-		// 컨텍스트 취소 확인
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		resp = c.abciClient.BeginBlockSync(req)
-		if resp.Error == nil {
-			break
-		}
-
-		log.Warn("BeginBlock failed, retrying", "error", resp.Error, "retry", retries+1, "height", req.Header.Height)
-		retries++
-
-		if retries < maxRetries {
-			// 지수 백오프 방식으로 대기
-			time.Sleep(time.Second * time.Duration(1<<retries))
-			continue
-		}
-
+	resp := c.abciClient.BeginBlockSync(req)
+	if resp.Error != nil {
 		return nil, resp.Error
 	}
-
-	log.Debug("Block processing started",
-		"height", req.Header.Height,
-		"time", req.Header.Time,
-		"proposer", fmt.Sprintf("%X", req.Header.ProposerAddress),
-		"events", len(resp.Response.Events))
 
 	return &resp.Response, nil
 }
 
 // CheckTx implements the ITendermintClient interface
 func (c *TendermintABCIClient) CheckTx(ctx context.Context, req types.RequestCheckTx) (*types.ResponseCheckTx, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.abciMutex.RLock()
 	defer c.abciMutex.RUnlock()
 
@@ -296,48 +200,16 @@ func (c *TendermintABCIClient) CheckTx(ctx context.Context, req types.RequestChe
 		return nil, ErrABCINotConnected
 	}
 
-	// 재시도 로직 구현
-	var (
-		resp    abciclient.ResultCheckTx
-		retries = 0
-	)
-
-	for retries < maxRetries {
-		resp = c.abciClient.CheckTxSync(req)
-		if resp.Error == nil {
-			break
-		}
-
-		log.Warn("CheckTx failed, retrying", "error", resp.Error, "retry", retries+1)
-		retries++
-
-		if retries < maxRetries {
-			// 지수 백오프 방식으로 대기
-			time.Sleep(time.Second * time.Duration(1<<retries))
-			continue
-		}
-
+	resp := c.abciClient.CheckTxSync(req)
+	if resp.Error != nil {
 		return nil, resp.Error
 	}
-
-	// 트랜잭션 메타데이터 로깅
-	txHash := sha256.Sum256(req.Tx)
-	log.Debug("CheckTx completed",
-		"tx_hash", fmt.Sprintf("%X", txHash[:8]),
-		"gas_wanted", resp.Response.GasWanted,
-		"gas_used", resp.Response.GasUsed,
-		"code", resp.Response.Code)
 
 	return &resp.Response, nil
 }
 
 // DeliverTx implements the ITendermintClient interface
 func (c *TendermintABCIClient) DeliverTx(ctx context.Context, req types.RequestDeliverTx) (*types.ResponseDeliverTx, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.abciMutex.RLock()
 	defer c.abciMutex.RUnlock()
 
@@ -345,53 +217,9 @@ func (c *TendermintABCIClient) DeliverTx(ctx context.Context, req types.RequestD
 		return nil, ErrABCINotConnected
 	}
 
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, deliverTxTimeout)
-	defer cancel()
-
-	// 재시도 로직 구현
-	var (
-		resp    abciclient.ResultDeliverTx
-		retries = 0
-	)
-
-	for retries < maxRetries {
-		// 컨텍스트 취소 확인
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		resp = c.abciClient.DeliverTxSync(req)
-		if resp.Error == nil {
-			break
-		}
-
-		log.Warn("DeliverTx failed, retrying", "error", resp.Error, "retry", retries+1)
-		retries++
-
-		if retries < maxRetries {
-			// 지수 백오프 방식으로 대기
-			time.Sleep(time.Second * time.Duration(1<<retries))
-			continue
-		}
-
+	resp := c.abciClient.DeliverTxSync(req)
+	if resp.Error != nil {
 		return nil, resp.Error
-	}
-
-	// 트랜잭션 메타데이터 로깅
-	txHash := sha256.Sum256(req.Tx)
-	log.Debug("DeliverTx completed",
-		"tx_hash", fmt.Sprintf("%X", txHash[:8]),
-		"gas_wanted", resp.Response.GasWanted,
-		"gas_used", resp.Response.GasUsed,
-		"code", resp.Response.Code)
-
-	// 이벤트 처리 (옵션)
-	if len(resp.Response.Events) > 0 {
-		log.Debug("DeliverTx events", "events_count", len(resp.Response.Events))
-		for i, event := range resp.Response.Events {
-			log.Debug("Event", "index", i, "type", event.Type, "attributes_count", len(event.Attributes))
-		}
 	}
 
 	return &resp.Response, nil
@@ -399,11 +227,6 @@ func (c *TendermintABCIClient) DeliverTx(ctx context.Context, req types.RequestD
 
 // EndBlock implements the ITendermintClient interface
 func (c *TendermintABCIClient) EndBlock(ctx context.Context, req types.RequestEndBlock) (*types.ResponseEndBlock, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.abciMutex.RLock()
 	defer c.abciMutex.RUnlock()
 
@@ -411,61 +234,16 @@ func (c *TendermintABCIClient) EndBlock(ctx context.Context, req types.RequestEn
 		return nil, ErrABCINotConnected
 	}
 
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, blockProcessingTimeout)
-	defer cancel()
-
-	// 재시도 로직 구현
-	var (
-		resp    abciclient.ResultEndBlock
-		retries = 0
-	)
-
-	for retries < maxRetries {
-		// 컨텍스트 취소 확인
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		resp = c.abciClient.EndBlockSync(req)
-		if resp.Error == nil {
-			break
-		}
-
-		log.Warn("EndBlock failed, retrying", "error", resp.Error, "retry", retries+1, "height", req.Height)
-		retries++
-
-		if retries < maxRetries {
-			// 지수 백오프 방식으로 대기
-			time.Sleep(time.Second * time.Duration(1<<retries))
-			continue
-		}
-
+	resp := c.abciClient.EndBlockSync(req)
+	if resp.Error != nil {
 		return nil, resp.Error
 	}
-
-	// 검증자 변경 이벤트가 있을 경우 로깅
-	if len(resp.Response.ValidatorUpdates) > 0 {
-		log.Info("Validator set updated",
-			"height", req.Height,
-			"updates", len(resp.Response.ValidatorUpdates))
-	}
-
-	log.Debug("Block processing completed",
-		"height", req.Height,
-		"events", len(resp.Response.Events),
-		"validator_updates", len(resp.Response.ValidatorUpdates))
 
 	return &resp.Response, nil
 }
 
 // Commit implements the ITendermintClient interface
 func (c *TendermintABCIClient) Commit(ctx context.Context) (*types.ResponseCommit, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.abciMutex.RLock()
 	defer c.abciMutex.RUnlock()
 
@@ -473,45 +251,10 @@ func (c *TendermintABCIClient) Commit(ctx context.Context) (*types.ResponseCommi
 		return nil, ErrABCINotConnected
 	}
 
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, commitTimeout)
-	defer cancel()
-
-	// 재시도 로직 구현
-	var (
-		resp    abciclient.ResultCommit
-		retries = 0
-		start   = time.Now()
-	)
-
-	for retries < maxRetries {
-		// 컨텍스트 취소 확인
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		resp = c.abciClient.CommitSync()
-		if resp.Error == nil {
-			break
-		}
-
-		log.Warn("Commit failed, retrying", "error", resp.Error, "retry", retries+1)
-		retries++
-
-		if retries < maxRetries {
-			// 지수 백오프 방식으로 대기
-			time.Sleep(time.Second * time.Duration(1<<retries))
-			continue
-		}
-
+	resp := c.abciClient.CommitSync()
+	if resp.Error != nil {
 		return nil, resp.Error
 	}
-
-	elapsed := time.Since(start)
-	log.Debug("Block committed",
-		"app_hash", fmt.Sprintf("%X", resp.Response.Data),
-		"height", resp.Response.RetainHeight,
-		"elapsed", elapsed)
 
 	return &resp.Response, nil
 }
@@ -945,13 +688,8 @@ func (c *TendermintABCIClient) Close() {
 	close(c.closeCh)
 }
 
-// BlockInfo implements the ITendermintClient interface
+// BlockInfo 메서드는 특정 높이의 블록 정보를 조회합니다.
 func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*eirene.BlockInfo, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
 	c.rpcMutex.RLock()
 	defer c.rpcMutex.RUnlock()
 
@@ -959,157 +697,65 @@ func (c *TendermintABCIClient) BlockInfo(ctx context.Context, height *int64) (*e
 		return nil, ErrRPCNotConnected
 	}
 
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, blockInfoTimeout)
-	defer cancel()
-
-	// 블록 정보 조회
-	blockResp, err := c.rpcClient.Block(ctx, height)
+	// Tendermint RPC를 통해 블록 정보 조회
+	result, err := c.rpcClient.Block(ctx, height)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch block: %w", err)
+		return nil, fmt.Errorf("failed to get block info: %w", err)
 	}
 
-	if blockResp.BlockID.Hash == nil || blockResp.Block == nil {
+	if result.BlockID.Hash == nil || result.Block == nil {
 		return nil, fmt.Errorf("invalid block response: empty block data")
 	}
 
 	// 블록 정보 변환
 	blockInfo := &eirene.BlockInfo{
 		BlockID: eirene.BlockID{
-			Hash: blockResp.BlockID.Hash,
+			Hash: result.BlockID.Hash,
 		},
 		Header: eirene.BlockHeader{
-			ChainID:         blockResp.Block.ChainID,
-			Height:          blockResp.Block.Height,
-			Time:            blockResp.Block.Time,
-			DataHash:        blockResp.Block.DataHash,
-			AppHash:         blockResp.Block.AppHash,
-			ProposerAddress: blockResp.Block.ProposerAddress,
+			ChainID:         result.Block.ChainID,
+			Height:          result.Block.Height,
+			Time:            result.Block.Time,
+			DataHash:        result.Block.DataHash,
+			AppHash:         result.Block.AppHash,
+			ProposerAddress: result.Block.ProposerAddress,
 		},
 	}
 
 	// Parts Header 설정
-	blockInfo.BlockID.PartsHeader.Total = blockResp.BlockID.PartSetHeader.Total
-	blockInfo.BlockID.PartsHeader.Hash = blockResp.BlockID.PartSetHeader.Hash
+	blockInfo.BlockID.PartsHeader.Total = result.BlockID.PartSetHeader.Total
+	blockInfo.BlockID.PartsHeader.Hash = result.BlockID.PartSetHeader.Hash
 
 	// Version 설정
-	blockInfo.Header.Version.Block = uint64(blockResp.Block.Version.Block)
-	blockInfo.Header.Version.App = uint64(blockResp.Block.Version.App)
+	blockInfo.Header.Version.Block = uint64(result.Block.Version.Block)
+	blockInfo.Header.Version.App = uint64(result.Block.Version.App)
 
 	// 트랜잭션 데이터 설정
-	blockInfo.Data.Txs = make([][]byte, len(blockResp.Block.Txs))
-	for i, tx := range blockResp.Block.Txs {
+	blockInfo.Data.Txs = make([][]byte, len(result.Block.Txs))
+	for i, tx := range result.Block.Txs {
 		blockInfo.Data.Txs[i] = tx
 	}
 
 	// 해시 데이터 설정
-	blockInfo.Header.ValidatorsHash = blockResp.Block.ValidatorsHash
-	blockInfo.Header.NextValidatorsHash = blockResp.Block.NextValidatorsHash
-	blockInfo.Header.ConsensusHash = blockResp.Block.ConsensusHash
-	blockInfo.Header.LastResultsHash = blockResp.Block.LastResultsHash
-	blockInfo.Header.EvidenceHash = blockResp.Block.EvidenceHash
+	blockInfo.Header.ValidatorsHash = result.Block.ValidatorsHash
+	blockInfo.Header.NextValidatorsHash = result.Block.NextValidatorsHash
+	blockInfo.Header.ConsensusHash = result.Block.ConsensusHash
+	blockInfo.Header.LastResultsHash = result.Block.LastResultsHash
+	blockInfo.Header.EvidenceHash = result.Block.EvidenceHash
 
 	// LastBlockID 설정
-	blockInfo.Header.LastBlockID.Hash = blockResp.Block.LastBlockID.Hash
-	blockInfo.Header.LastBlockID.PartsHeader.Total = blockResp.Block.LastBlockID.PartSetHeader.Total
-	blockInfo.Header.LastBlockID.PartsHeader.Hash = blockResp.Block.LastBlockID.PartSetHeader.Hash
+	blockInfo.Header.LastBlockID.Hash = result.Block.LastBlockID.Hash
+	blockInfo.Header.LastBlockID.PartsHeader.Total = result.Block.LastBlockID.PartSetHeader.Total
+	blockInfo.Header.LastBlockID.PartsHeader.Hash = result.Block.LastBlockID.PartSetHeader.Hash
 
 	// LastCommit 설정
-	if blockResp.Block.LastCommit != nil {
-		blockInfo.Header.LastCommit.Height = blockResp.Block.LastCommit.Height
-		blockInfo.Header.LastCommit.Round = blockResp.Block.LastCommit.Round
-		blockInfo.Header.LastCommit.BlockID.Hash = blockResp.Block.LastCommit.BlockID.Hash
-		blockInfo.Header.LastCommit.BlockID.PartsHeader.Total = blockResp.Block.LastCommit.BlockID.PartSetHeader.Total
-		blockInfo.Header.LastCommit.BlockID.PartsHeader.Hash = blockResp.Block.LastCommit.BlockID.PartSetHeader.Hash
+	if result.Block.LastCommit != nil {
+		blockInfo.Header.LastCommit.Height = result.Block.LastCommit.Height
+		blockInfo.Header.LastCommit.Round = result.Block.LastCommit.Round
+		blockInfo.Header.LastCommit.BlockID.Hash = result.Block.LastCommit.BlockID.Hash
+		blockInfo.Header.LastCommit.BlockID.PartsHeader.Total = result.Block.LastCommit.BlockID.PartSetHeader.Total
+		blockInfo.Header.LastCommit.BlockID.PartsHeader.Hash = result.Block.LastCommit.BlockID.PartSetHeader.Hash
 	}
-
-	// 메트릭스 업데이트 및 로깅
-	log.Debug("Block info retrieved",
-		"height", blockInfo.Header.Height,
-		"time", blockInfo.Header.Time,
-		"tx_count", len(blockInfo.Data.Txs))
 
 	return blockInfo, nil
-}
-
-// ReconnectIfNeeded는 연결이 끊어진 경우 자동으로 재연결을 시도합니다.
-func (c *TendermintABCIClient) ReconnectIfNeeded() error {
-	// ABCI 연결 확인 및 재연결
-	c.abciMutex.RLock()
-	abciConnected := c.isABCIConnected
-	c.abciMutex.RUnlock()
-
-	if !abciConnected {
-		log.Warn("ABCI connection lost, attempting to reconnect")
-		if err := c.connectABCI(); err != nil {
-			return fmt.Errorf("failed to reconnect ABCI: %w", err)
-		}
-		log.Info("ABCI connection re-established")
-	}
-
-	// RPC 연결 확인 및 재연결
-	c.rpcMutex.RLock()
-	rpcConnected := c.isRPCConnected
-	c.rpcMutex.RUnlock()
-
-	if !rpcConnected {
-		log.Warn("RPC connection lost, attempting to reconnect")
-		if err := c.connectRPC(); err != nil {
-			return fmt.Errorf("failed to reconnect RPC: %w", err)
-		}
-		log.Info("RPC connection re-established")
-	}
-
-	return nil
-}
-
-// GetMempoolInfo implements the ITendermintClient interface
-func (c *TendermintABCIClient) GetMempoolInfo(ctx context.Context, includeTxs bool) (*eirene.MempoolInfo, error) {
-	// 자동 재연결 시도
-	if err := c.ReconnectIfNeeded(); err != nil {
-		return nil, fmt.Errorf("reconnection failed: %w", err)
-	}
-
-	c.rpcMutex.RLock()
-	defer c.rpcMutex.RUnlock()
-
-	if !c.isRPCConnected {
-		return nil, ErrRPCNotConnected
-	}
-
-	// 컨텍스트에 타임아웃 설정
-	ctx, cancel := context.WithTimeout(ctx, mempoolTimeout)
-	defer cancel()
-
-	// Unconfirmed transactions 조회
-	result, err := c.rpcClient.UnconfirmedTxs(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch mempool info: %w", err)
-	}
-
-	// 메모리풀 통계 정보 조회
-	countResult, err := c.rpcClient.NumUnconfirmedTxs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch mempool stats: %w", err)
-	}
-
-	// MempoolInfo 구조체 생성
-	mempoolInfo := &eirene.MempoolInfo{
-		TxsCount:    countResult.Count,
-		TotalBytes:  countResult.Total,
-		MaxTxs:      countResult.MaxTxs,
-		MaxTxsBytes: countResult.MaxBytes,
-	}
-
-	// 선택적으로 트랜잭션 목록 포함
-	if includeTxs {
-		mempoolInfo.PendingTxs = result.Txs
-	}
-
-	log.Debug("Mempool info retrieved",
-		"tx_count", mempoolInfo.TxsCount,
-		"total_bytes", mempoolInfo.TotalBytes,
-		"included_txs", includeTxs && len(mempoolInfo.PendingTxs) > 0)
-
-	return mempoolInfo, nil
 }

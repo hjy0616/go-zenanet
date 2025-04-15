@@ -152,3 +152,4 @@ require (
 
 // Replace Tendermint with local version
 replace github.com/maticnetwork/tendermint => ../tendermint
+replace github.com/tendermint/tendermint => ../tendermint
